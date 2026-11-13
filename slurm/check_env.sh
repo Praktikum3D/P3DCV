@@ -2,7 +2,6 @@
 #SBATCH --job-name=check-env
 #SBATCH --partition=12g
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=2
 #SBATCH --mem=12G
 #SBATCH --time=00:15:00
 #SBATCH --output=/mnt/home/%u/runs/%x-%j.out

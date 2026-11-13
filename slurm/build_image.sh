@@ -2,7 +2,6 @@
 #SBATCH --job-name=build-image
 #SBATCH --partition=12g
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
 #SBATCH --time=03:00:00
 #SBATCH --output=/mnt/home/%u/runs/%x-%j.out
