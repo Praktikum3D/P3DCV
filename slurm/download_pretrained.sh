@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=download-pretrained
 #SBATCH --partition=data
-#SBATCH --mem=4G
 #SBATCH --time=06:00:00
 #SBATCH --output=/mnt/home/%u/runs/%x-%j.out
 #SBATCH --error=/mnt/home/%u/runs/%x-%j.err
