@@ -81,6 +81,10 @@ the capability times ten, 75 is an RTX 20xx):
 #SBATCH --gres=gpu:1,ccc:75
 ```
 
+Running the E-RayZer model itself needs more: an RTX 30xx or newer
+(`ccc:86`), which only the `24g` and `h200` partitions have. See
+[inference.md](inference.md).
+
 ## Rules for job scripts
 
 - Do not set `--cpus-per-task` or `--mem`. Both are assigned per GPU and the
