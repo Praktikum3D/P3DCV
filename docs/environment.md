@@ -57,7 +57,7 @@ gsplat and checks that the pretrained weights are present.
 3. Rebuild and verify:
 
 ```bash
-sbatch ~/code/P3DCV/slurm/build_image.sh     # roughly 15 to 30 minutes
+sbatch ~/code/P3DCV/slurm/build_image.sh     # about 30 minutes, the image is 18 GB
 sbatch ~/code/P3DCV/slurm/check_env.sh
 ```
 
