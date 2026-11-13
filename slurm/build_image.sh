@@ -12,19 +12,16 @@ set -euo pipefail
 source "${REPO_DIR:-/mnt/home/$USER/code/P3DCV}/slurm/common.sh"
 
 TAG=p3dcv
-TMP_IMAGE="/tmp/$USER-$TAG-$SLURM_JOB_ID.sqsh"
+set -x
 
 podman build -t "$TAG" -f "$REPO_DIR/docker/Dockerfile" "$REPO_DIR/docker"
 
-rm -f "$TMP_IMAGE"
-enroot import -o "$TMP_IMAGE" "podman://$TAG"
-
-# Replace the shared image in one step so running jobs never see a partial file.
+# Write next to the final location and rename at the end, so running jobs
+# never see a partial image. The image is too large for /tmp.
 mkdir -p "$(dirname "$IMAGE")"
-cp "$TMP_IMAGE" "$IMAGE.tmp"
+rm -f "$IMAGE.tmp"
+enroot import -o "$IMAGE.tmp" "podman://$TAG"
 mv "$IMAGE.tmp" "$IMAGE"
-rm -f "$TMP_IMAGE"
-podman rmi -f "$TAG" || true
 
 ls -lh "$IMAGE"
 echo "Image written. Verify it with: sbatch $REPO_DIR/slurm/check_env.sh"
