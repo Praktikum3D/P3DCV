@@ -1,7 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=demo
-#SBATCH --partition=12g
-#SBATCH --gres=gpu:1,ccc:75
+# E-RayZer runs in bf16, which xformers supports only on RTX 30xx and newer
+# (ccc:86). Those GPUs are in the 24g partition.
+#SBATCH --partition=24g
+#SBATCH --gres=gpu:1,ccc:86
 #SBATCH --time=02:00:00
 #SBATCH --output=/mnt/home/%u/runs/%x-%j.out
 #SBATCH --error=/mnt/home/%u/runs/%x-%j.err
