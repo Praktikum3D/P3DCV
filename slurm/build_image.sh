@@ -12,7 +12,6 @@ set -euo pipefail
 source "${REPO_DIR:-/mnt/home/$USER/code/P3DCV}/slurm/common.sh"
 
 TAG=p3dcv
-set -x
 
 podman build -t "$TAG" -f "$REPO_DIR/docker/Dockerfile" "$REPO_DIR/docker"
 
@@ -20,7 +19,12 @@ podman build -t "$TAG" -f "$REPO_DIR/docker/Dockerfile" "$REPO_DIR/docker"
 # never see a partial image. The image is too large for /tmp.
 mkdir -p "$(dirname "$IMAGE")"
 rm -f "$IMAGE.tmp"
-enroot import -o "$IMAGE.tmp" "podman://$TAG"
+# On this cluster `enroot import` exits with status 127 after it has written
+# the complete image, so its exit status is ignored and the result is
+# verified instead.
+enroot import -o "$IMAGE.tmp" "podman://$TAG" || echo "enroot import exited with status $?"
+unsquashfs -s "$IMAGE.tmp" > /dev/null
+chmod 660 "$IMAGE.tmp"
 mv "$IMAGE.tmp" "$IMAGE"
 
 ls -lh "$IMAGE"
