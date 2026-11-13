@@ -23,7 +23,7 @@ rm -f "$IMAGE.tmp"
 # the complete image, so its exit status is ignored and the result is
 # verified instead.
 enroot import -o "$IMAGE.tmp" "podman://$TAG" || echo "enroot import exited with status $?"
-unsquashfs -s "$IMAGE.tmp" > /dev/null
+[ "$(head -c 4 "$IMAGE.tmp")" = hsqs ] || { echo "no squashfs image was written" >&2; exit 1; }
 chmod 660 "$IMAGE.tmp"
 mv "$IMAGE.tmp" "$IMAGE"
 

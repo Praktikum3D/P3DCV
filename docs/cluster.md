@@ -73,8 +73,13 @@ branch.
 `data` is a partition, not a folder: `sbatch --partition=data script.sh`.
 
 gsplat does not run on the TITAN X and TITAN Xp nodes (`dortmund`, `jena`,
-`ulm`). Jobs that render must exclude them:
-`#SBATCH --exclude=dortmund,jena,ulm`.
+`ulm`). Jobs that render must ask for a newer GPU. `--exclude` is not allowed
+on this cluster; request a minimum CUDA compute capability instead (`ccc` is
+the capability times ten, 75 is an RTX 20xx):
+
+```bash
+#SBATCH --gres=gpu:1,ccc:75
+```
 
 ## Rules for job scripts
 
