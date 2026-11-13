@@ -18,8 +18,10 @@ RUN pip install -r /tmp/requirements.txt
 # gsplat fork used by E-RayZer (adds gradients w.r.t. intrinsics), pinned to
 # the commit of branch v1.4.0-working. The CUDA extension is compiled here.
 # No GPU is visible during the build, so the target architectures are listed
-# explicitly: TITAN X (5.2), TITAN Xp (6.1), RTX 20xx / TITAN RTX (7.5),
-# RTX 3090 / A5000 (8.6), RTX 4090 (8.9), H200 (9.0).
-ENV TORCH_CUDA_ARCH_LIST="5.2 6.1 7.5 8.6 8.9 9.0"
+# explicitly: RTX 20xx / TITAN RTX / RTX 5000 (7.5), RTX 3090 / A5000 (8.6),
+# RTX 4090 (8.9), H200 (9.0). gsplat does not compile for anything older
+# (it needs cooperative_groups::labeled_partition), so the image cannot
+# render on the TITAN X / TITAN Xp nodes dortmund, jena and ulm.
+ENV TORCH_CUDA_ARCH_LIST="7.5 8.6 8.9 9.0"
 RUN MAX_JOBS=4 pip install --no-build-isolation \
         "git+https://github.com/QitaoZhao/gsplat.git@daad91d9e667cf49bab815d872aa65a5cda0a77e"

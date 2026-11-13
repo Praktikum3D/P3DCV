@@ -27,4 +27,4 @@ rm -f "$TMP_IMAGE"
 podman rmi -f "$TAG" || true
 
 ls -lh "$IMAGE"
-in_container python "$REPO_DIR/scripts/check_env.py"
+echo "Image written. Verify it with: sbatch $REPO_DIR/slurm/check_env.sh"

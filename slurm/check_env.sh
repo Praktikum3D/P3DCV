@@ -2,6 +2,8 @@
 #SBATCH --job-name=check-env
 #SBATCH --partition=12g
 #SBATCH --gres=gpu:1
+# gsplat needs an RTX 20xx or newer; these nodes have TITAN X / TITAN Xp.
+#SBATCH --exclude=dortmund,jena,ulm
 #SBATCH --time=00:15:00
 #SBATCH --output=/mnt/home/%u/runs/%x-%j.out
 #SBATCH --error=/mnt/home/%u/runs/%x-%j.err
