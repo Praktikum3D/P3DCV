@@ -3,10 +3,11 @@
 The goal is to fine-tune a pretrained E-RayZer model on TartanAir. This
 document describes what is in place and how a run is meant to be set up.
 
-> **Not runnable yet.** The E-RayZer model and training code and the
-> TartanAir data loader are not in this repository yet. The sections "How a
-> run is set up" and "Job script" describe the intended workflow and will be
-> updated once the code is imported.
+> **Not runnable yet.** The E-RayZer model and training code are in this
+> repository (`train.py`, `training/`, `erayzer_core/`), but the only data
+> loader is the one for DL3DV. Training on TartanAir needs a new loader. The
+> sections "How a run is set up" and "Job script" describe the intended
+> workflow and will be updated once the loader exists.
 
 ## Pretrained weights
 
@@ -49,6 +50,9 @@ and `config/erayzer_train_dl3dv.yaml`:
 - **One GPU instead of eight.** A student job gets a single 24 GB GPU, so the
   batch size has to shrink and gradient accumulation has to make up for it.
   The batch size that fits is still to be measured.
+- **Only RTX 30xx or newer.** The model runs in bf16, which works only on
+  the RTX 3090, RTX A5000, RTX 4090 and H200 nodes (see
+  [inference.md](inference.md)). Request them with `--gres=gpu:1,ccc:86`.
 - **24 hour limit.** Every run has to continue from `last.pt` when it is
   resubmitted.
 - **TartanAir loader.** A new loader that reads from the zip archives, plus a
@@ -80,7 +84,7 @@ A training job follows the same pattern as the other scripts in `slurm/`:
 #!/bin/bash
 #SBATCH --job-name=train
 #SBATCH --partition=24g
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:1,ccc:86
 #SBATCH --time=1-00:00:00
 #SBATCH --output=/mnt/home/%u/runs/%x-%j.out
 #SBATCH --error=/mnt/home/%u/runs/%x-%j.err
@@ -114,6 +118,6 @@ Submitting the same command again continues the run:
 sbatch slurm/train.sh 2026-11-20_fisheye-baseline_alex
 ```
 
-Before a long run on `24g`, test the same configuration for a few steps on
-`12g`. `24g` cancels jobs that use less than 12 GB of GPU memory or leave the
-GPU idle.
+`24g` cancels jobs that leave the GPU idle for 2 hours or that average
+below 10 % GPU use or below 12 GB of GPU memory over 6 hours. Test a new
+configuration with a few steps first (`MAX_STEPS=10` upstream).
