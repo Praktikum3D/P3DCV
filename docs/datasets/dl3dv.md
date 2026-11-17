@@ -26,14 +26,5 @@ scenes/<scene id>/images_undistort/*.png    the 10 images of the protocol
 the same as in the full dataset. Only the frames named in `frames_with_image`
 have an image. Another `FRAME_DIST` needs its own archive.
 
-## How it was made
-
-The scripts that built the archive are stored next to it in
-`/mnt/projects/p3dcv/anycam/data/dl3dv/prepare/`. They are only needed if the
-archive is lost or another `FRAME_DIST` is wanted. The dataset is gated, so
-this needs a Hugging Face account that accepted the terms of
-`DL3DV/DL3DV-Benchmark` and a read token in `~/.cache/huggingface/token`.
-
-```bash
-sbatch /mnt/projects/p3dcv/anycam/data/dl3dv/prepare/download.sh
-```
+The images come from the Hugging Face dataset `DL3DV/DL3DV-Benchmark` and were
+undistorted with the camera parameters of the dataset.
