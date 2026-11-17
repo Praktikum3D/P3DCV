@@ -26,7 +26,7 @@ License and must not be committed to this repository.
 
 ## What upstream E-RayZer provides
 
-From the upstream [training documentation](https://github.com/QitaoZhao/E-RayZer/blob/main/docs/train.md)
+From the upstream [training documentation](https://github.com/QitaoZhao/E-RayZer/blob/4309c76/docs/train.md)
 and `config/erayzer_train_dl3dv.yaml`:
 
 - Entry point `train.py` with a YAML config, launched through

@@ -1,8 +1,11 @@
 # Environment
 
 All jobs run inside one container image,
-`/mnt/projects/p3dcv/anycam/envs/p3dcv.sqsh`. It replaces a conda environment,
-which would exceed the file limit of the cluster.
+`/mnt/projects/p3dcv/anycam/envs/p3dcv.sqsh`. It is the only supported way
+to run the code: there is no conda or virtual environment (it would exceed
+the file limit of the cluster) and no git submodule. The setup instructions
+of the original E-RayZer repository (`setup_train_env.sh`,
+`git submodule update`, `pip install -e third_party/gsplat`) do not apply.
 
 ## Content
 
