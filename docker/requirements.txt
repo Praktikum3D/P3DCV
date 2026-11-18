@@ -26,3 +26,5 @@ tqdm>=4.66.0
 
 # Project additions
 wandb
+jupyterlab
+ipykernel
