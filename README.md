@@ -1,16 +1,5 @@
-# P3DCV
-
-Self supervised 3D reconstruction for arbitrary cameras. We take
-[E-RayZer](https://github.com/QitaoZhao/E-RayZer) and adapt it on
-[TartanAir V2](https://tartanair.org) so that it also handles fisheye images.
-Practical course 3D Computer Vision, CAMP, TUM, winter term 2026/27.
-
 ## Quick start
-
-Everything runs in one container image on the CAMP cluster. There is no other
-way to run the code and nothing to install. You need a cluster account and
-the VPN, see [docs/cluster.md](docs/cluster.md).
-
+You only have to do the setup once (create folders, etc...)
 ```bash
 ssh <user>@131.159.11.60
 mkdir -p ~/code ~/runs && cd ~/code
@@ -53,19 +42,3 @@ two more in parallel. All logs go to `~/runs`.
 | `config/` | Model and run configurations |
 | `train.py`, `evaluate.py`, `gradio_app.py` | Entry points |
 
-Code lives in this repository with one clone per person. The image, the data
-and the weights live in the team folder `/mnt/projects/p3dcv/anycam` and
-never in git.
-
-The model code comes from E-RayZer at commit `4309c76`. Its license is in
-`LICENSE-ERAYZER` and the license of the pretrained weights in
-`LICENSE-WEIGHTS`.
-
-## Conventions
-
-* Write code, comments and documentation in English.
-* Work on a branch and open a pull request into `main`.
-* Use the variables from `slurm/common.sh` instead of hard coded paths.
-* Add new packages to `docker/requirements.txt` and never install them by hand.
-* Tell the team before you change anything in the team folder. It has one
-  quota for all of us and no backup.
