@@ -40,7 +40,6 @@ else
   CURRICULUM_START_MAX_FRAME_DIST="${CURRICULUM_START_MAX_FRAME_DIST:-1.0}"
 fi
 
-export PYTHONPATH="$(pwd)/third_party/gsplat:${PYTHONPATH:-}"
 if command -v python >/dev/null 2>&1; then
   TORCH_LIB_PATH="$(python - <<'PY' || true
 import glob

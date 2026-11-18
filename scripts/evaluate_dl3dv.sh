@@ -9,7 +9,6 @@ CKPT_PATH="${CKPT_PATH:-checkpoints/erayzer_dl3dv.pt}"
 EVAL_OUT_DIR="${EVAL_OUT_DIR:-experiments/evaluation/erayzer-dl3dv}"
 FRAME_DIST="${FRAME_DIST:-96}"
 
-export PYTHONPATH="$(pwd)/third_party/gsplat:${PYTHONPATH:-}"
 if command -v python >/dev/null 2>&1; then
   TORCH_LIB_PATH="$(python - <<'PY' || true
 import glob
