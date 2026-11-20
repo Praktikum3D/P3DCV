@@ -49,6 +49,39 @@ for the [released code](https://github.com/QitaoZhao/E-RayZer/blob/4309c76/docs/
 
 `erayzer_dl3dv.pt` is the checkpoint behind the DL3DV row of the paper.
 
+## TartanAir
+
+`slurm/evaluate_tartanair.sh` runs the same metrics on held out TartanAir
+environments, by default HongKong and Office in `Data_hard`. Per trajectory
+the model gets 10 views spread over 40 frames, which is 4 seconds at 10 Hz.
+
+```bash
+sbatch ~/code/P3DCV/slurm/evaluate_tartanair.sh                     # pinhole lcam_front
+CAMERA=lcam_fish sbatch ~/code/P3DCV/slurm/evaluate_tartanair.sh    # fisheye
+cat ~/runs/eval-tartanair-*.out
+```
+
+`CKPT`, `ENVS` and `FRAME_DIST` override the defaults. Results go to
+`~/runs/eval/tartanair-<camera>-<checkpoint>-<job id>/`.
+
+Measured on 20 November 2026 with `erayzer_multi.pt` on 12 trajectories.
+
+| Camera | PSNR | RPA@5 | RPA@15 | RPA@30 |
+| --- | --- | --- | --- | --- |
+| `lcam_front` | 19.0532 | 0.0111 | 0.2370 | 0.4926 |
+| `lcam_fish` | 16.7040 | 0.0000 | 0.0259 | 0.2148 |
+
+* The fisheye images keep their black border, which also counts in the PSNR.
+* The model renders pinhole images, so the fisheye PSNR compares a pinhole
+  render with a fisheye target.
+* RPA is far below DL3DV. `Data_hard` moves fast and turns a lot, and the
+  pose conversion from NED in the data loader has not been checked against a
+  second tool yet.
+
+`scripts/camera_head.py` shows the camera the model assumes for a sequence.
+On `ArchVizTinyHouseNight/Data_hard/P003` from `lcam_fish` it predicts
+f = 408 pixels at 256 x 256, a field of view of 35 degrees instead of 195.
+
 ## Output
 
 `~/runs/eval/dl3dv-<checkpoint>-<job id>/` holds `metrics.txt` with the
