@@ -55,14 +55,15 @@ model:
 
 training:
   dataset: tartanair
-  checkpoint_dir: experiments/checkpoints/erayzer-tartanair
+  checkpoint_dir: /mnt/projects/p3dcv/anycam/checkpoints/runs/erayzer-tartanair
   resume_ckpt: /mnt/projects/p3dcv/anycam/checkpoints/pretrained/erayzer_multi.pt
   reset_training_state: true
 
-  batch_size_per_gpu: 8
+  batch_size_per_gpu: 2
   num_workers: 4
   max_fwdbwd_passes: 20000
   checkpoint_every: 1000
+  save_last: true
   grad_checkpoint_every: 1
   print_every: 20
 
@@ -90,14 +91,14 @@ training:
   weight_decay: 0.05
   warmup: 500
   scheduler_type: cosine
-  grad_accum_steps: 1
+  grad_accum_steps: 4
   grad_clip_norm: 1.0
   freeze_focal_steps: 0
   no_pass_steps: 0
   l2_loss_weight: 1.0
   l1_loss_weight: 0.0
   perceptual_loss_weight: 0.2
-  perceptual_loss_weight_path: weights/imagenet-vgg-verydeep-19.mat
+  perceptual_loss_weight_path: /mnt/projects/p3dcv/anycam/checkpoints/pretrained/imagenet-vgg-verydeep-19.mat
   use_amp: true
   amp_dtype: bf16
   use_tf32: true
