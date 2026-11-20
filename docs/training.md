@@ -33,12 +33,39 @@ committed.
 A test with two steps, batch size 2 and `VIEW_SELECTOR_TYPE=two_frame` ran on
 one RTX 3090 in November 2026.
 
+## Fine-tuning on the DL3DV subset
+
+`slurm/train_dl3dv.sh` fine-tunes `erayzer_dl3dv.pt` on one 24 GB GPU with the
+140 scenes of `data/dl3dv/benchmark_fd96.zip`. The job unpacks the archive to
+`/tmp` and runs `scripts/prepare_dl3dv_train.py`. That script keeps the 10
+frames per scene that have an image and holds 20 scenes out of training. The
+shared data folder is only read.
+
+```bash
+sbatch --export=ALL,RUN_NAME=myrun slurm/train_dl3dv.sh
+# longer than 24 hours: queue jobs that continue one after another
+for i in 1 2 3; do sbatch --job-name=train-myrun --dependency=singleton \
+    --export=ALL,RUN_NAME=myrun slurm/train_dl3dv.sh; done
+# evaluate on the held-out scenes only
+sbatch --export=ALL,CKPT=$RUNS/myrun/last.pt,SCENE_LIST=$RUNS/myrun/holdout_scenes.txt \
+    slurm/evaluate_dl3dv.sh
+```
+
+with `RUNS=/mnt/projects/p3dcv/anycam/checkpoints/runs`. A job continues from
+the newest checkpoint in the run folder and keeps the two newest `ckpt_*.pt`.
+Defaults: batch size 2 with 4 accumulation steps, learning rate 1e-4 with 500
+warmup steps, 20 000 steps. They can be changed with `BATCH_SIZE_PER_GPU`,
+`GRAD_ACCUM_STEPS`, `LR`, `WARMUP` and `MAX_STEPS`. On an RTX 3090 one step
+takes about 0.5 s.
+
+The 140 scenes are the DL3DV test split of the paper. Numbers on all 140
+scenes after fine-tuning are not comparable to the paper, so report the
+held-out scenes.
+
 ## What is missing
 
 * A data loader for TartanAir that reads from the zip archives
 * Ray conditioning and rendering for cameras that are not pinhole
-* A job script that continues from `last.pt`, because jobs end after 24 hours
-* A batch size and gradient accumulation that fit one 24 GB GPU
 * Experiment tracking, for which `wandb` is already in the image
 
 Checkpoints of our runs go to

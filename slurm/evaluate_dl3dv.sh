@@ -8,7 +8,8 @@
 
 # Evaluates a checkpoint on the DL3DV benchmark with the protocol of the
 # E-RayZer paper. See docs/evaluation.md. CKPT, ARCHIVE and OUT_DIR override
-# the defaults.
+# the defaults. SCENE_LIST, a file with one scene id per line such as the
+# holdout_scenes.txt of a training run, limits the evaluation to those scenes.
 set -euo pipefail
 source "${REPO_DIR:-/mnt/home/$USER/code/P3DCV}/slurm/common.sh"
 
@@ -21,11 +22,17 @@ WORK_DIR="/tmp/$USER-dl3dv-eval-$SLURM_JOB_ID"
 trap 'rm -rf "$WORK_DIR"' EXIT
 mkdir -p "$WORK_DIR"
 in_container python -m zipfile -e "$ARCHIVE" "$WORK_DIR"
+MANIFEST="$WORK_DIR/manifests/test_full.txt"
+if [[ -n "${SCENE_LIST:-}" ]]; then
+    grep -F -f "$SCENE_LIST" "$MANIFEST" > "$WORK_DIR/manifests/subset.txt"
+    MANIFEST="$WORK_DIR/manifests/subset.txt"
+    echo "Evaluating $(wc -l < "$MANIFEST") scenes from $SCENE_LIST"
+fi
 
 # The archive holds only the frames the protocol reads, so the manifest check,
 # which looks for the first two frames, is skipped.
 in_container bash -c "cd '$REPO_DIR' && env NUM_GPUS=1 CHECK_MANIFEST=false FRAME_DIST=96 \
-    MANIFEST_PATH='$WORK_DIR/manifests/test_full.txt' CKPT_PATH='$CKPT' EVAL_OUT_DIR='$OUT_DIR' \
+    MANIFEST_PATH='$MANIFEST' CKPT_PATH='$CKPT' EVAL_OUT_DIR='$OUT_DIR' \
     bash scripts/evaluate_dl3dv.sh"
 
 cat "$OUT_DIR/metrics.txt"

@@ -104,4 +104,5 @@ echo "View selector: type=${VIEW_SELECTOR_TYPE} key=${VIEW_SELECTOR_KEY_NAME} mi
   -s training.checkpoint_every "${CHECKPOINT_EVERY:-2000}" \
   -s training.save_last "${SAVE_LAST:-true}" \
   -s training.perceptual_loss_weight "${PERCEPTUAL_LOSS_WEIGHT}" \
-  -s training.perceptual_loss_weight_path "${PERCEPTUAL_LOSS_WEIGHT_PATH}"
+  -s training.perceptual_loss_weight_path "${PERCEPTUAL_LOSS_WEIGHT_PATH}" \
+  "$@"
