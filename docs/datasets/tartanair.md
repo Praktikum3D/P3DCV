@@ -69,6 +69,9 @@ values above rest on these sources.
 * On 20 November 2026 we measured the image circle of
   `ArchVizTinyHouseNight/Data_hard`. Non black pixels reach exactly 500 pixels
   from the centre, which matches the values above.
+* Resampling `lcam_fish` to pinhole cameras with `scripts/tartanair_remap.py`
+  gives straight edges at 60, 90 and 120 degrees. With a wrong field of view
+  straight lines would come out bent.
 * We have not yet compared a fisheye image with the matching `lcam_front`
   image ourselves. That needs an `image_lcam_front.zip` of the same
   environment.
@@ -80,12 +83,46 @@ There are two ways to train on several cameras with the same footage.
 * In the data loader. Any camera that looks forward and covers at most 195
   degrees can be resampled exactly from `lcam_fish`, for example pinhole with
   60 or 120 degrees or fisheye with 150 degrees. This needs no extra download.
-  At 256 x 256 the fisheye still has more than enough resolution.
+  `scripts/tartanair_remap.py` does this, see below.
 * With `ta.customize` from tartanairpy, which resamples the six raw cameras
   into any camera model, direction and field of view. It needs
   `image_lcam_front.zip`, `image_lcam_back.zip`, `image_lcam_left.zip`,
   `image_lcam_right.zip`, `image_lcam_top.zip` and `image_lcam_bottom.zip`
   unpacked, so run it on `/tmp` inside a job and zip the result again.
+
+### Resampling the fisheye
+
+`scripts/tartanair_remap.py` computes for every pixel of the new camera its
+ray, looks up that ray in `lcam_fish` and returns the image, a mask of valid
+pixels and the intrinsics. `remap_fisheye` in the same file is meant to be
+called from the data loader.
+
+```bash
+sbatch --partition=12g --gres=gpu:1,ccc:75 --time=00:10:00 \
+    --output=$HOME/runs/%x-%j.out --job-name=tartanair-remap --wrap \
+    "source ~/code/P3DCV/slurm/common.sh && in_container python ~/code/P3DCV/scripts/tartanair_remap.py \
+    --archive \$DATA_DIR/tartanair/ArchVizTinyHouseNight/Data_hard/image_lcam_fish.zip \
+    --trajectory P003 --frame 40 --out ~/runs/tartanair-remap"
+cat ~/runs/tartanair-remap-*.out
+```
+
+Output for 256 x 256 pixels.
+
+| Camera | fx = fy | cx = cy | Valid pixels |
+| --- | --- | --- | --- |
+| pinhole 60 degrees | 221.7 | 127.5 | 100 % |
+| pinhole 90 degrees | 128.0 | 127.5 | 100 % |
+| pinhole 120 degrees | 73.9 | 127.5 | 100 % |
+| fisheye 150 degrees | 97.8 | 127.5 | 78 % |
+| fisheye 195 degrees | 75.2 | 127.5 | 78 % |
+
+* The script first checks that resampling to the camera of the input gives the
+  input back unchanged.
+* It renders at four times the size and shrinks the result, which avoids
+  aliasing.
+* In the centre `lcam_fish` has 293.8 pixels per radian. At 256 x 256 a
+  pinhole camera needs at most that down to about 50 degrees. Narrower
+  cameras come out slightly blurred.
 
 ## Sizes
 
