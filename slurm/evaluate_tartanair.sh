@@ -12,14 +12,14 @@
 #   CAMERA      lcam_front (pinhole, default) or lcam_fish
 #   ENVS        environments to evaluate on, default HongKong and Office
 #   CKPT        checkpoint, default erayzer_multi.pt
-#   FRAME_DIST  frames spanned by the 10 views, default 40 (4 s at 10 Hz)
+#   FRAME_DIST  frames spanned by the 10 views, default 10 (1 s at 10 Hz)
 set -euo pipefail
 source "${REPO_DIR:-/mnt/home/$USER/code/P3DCV}/slurm/common.sh"
 
 CAMERA="${CAMERA:-lcam_front}"
 ENVS="${ENVS:-HongKong/Data_hard Office/Data_hard}"
 CKPT="${CKPT:-$PRETRAINED_DIR/erayzer_multi.pt}"
-FRAME_DIST="${FRAME_DIST:-40}"
+FRAME_DIST="${FRAME_DIST:-10}"
 OUT_DIR="${OUT_DIR:-/mnt/home/$USER/runs/eval/tartanair-$CAMERA-$(basename "$CKPT" .pt)-$SLURM_JOB_ID}"
 
 # One archive per environment, listed in a manifest the data loader reads.

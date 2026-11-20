@@ -68,8 +68,8 @@ training:
   max_resample_tries: 1
   view_selector:
     type: two_frame
-    min_frame_dist: 40
-    max_frame_dist: 40
+    min_frame_dist: 10
+    max_frame_dist: 10
     use_curriculum: false
   use_amp: true
   amp_dtype: bf16

@@ -53,7 +53,7 @@ for the [released code](https://github.com/QitaoZhao/E-RayZer/blob/4309c76/docs/
 
 `slurm/evaluate_tartanair.sh` runs the same metrics on held out TartanAir
 environments, by default HongKong and Office in `Data_hard`. Per trajectory
-the model gets 10 views spread over 40 frames, which is 4 seconds at 10 Hz.
+the model gets 10 views spread over 10 frames, which is 1 second at 10 Hz.
 
 ```bash
 sbatch ~/code/P3DCV/slurm/evaluate_tartanair.sh                     # pinhole lcam_front
@@ -66,17 +66,25 @@ cat ~/runs/eval-tartanair-*.out
 
 Measured on 20 November 2026 with `erayzer_multi.pt` on 12 trajectories.
 
-| Camera | PSNR | RPA@5 | RPA@15 | RPA@30 |
-| --- | --- | --- | --- | --- |
-| `lcam_front` | 19.0532 | 0.0111 | 0.2370 | 0.4926 |
-| `lcam_fish` | 16.7040 | 0.0000 | 0.0259 | 0.2148 |
+| Camera | Frames | PSNR | RPA@5 | RPA@15 | RPA@30 |
+| --- | --- | --- | --- | --- | --- |
+| `lcam_front` | 10 | 25.1719 | 0.1019 | 0.8167 | 0.9741 |
+| `lcam_fish` | 10 | 19.8620 | 0.0019 | 0.0852 | 0.3519 |
+| `lcam_front` | 40 | 19.0532 | 0.0111 | 0.2370 | 0.4926 |
+| `lcam_fish` | 40 | 16.7040 | 0.0000 | 0.0259 | 0.2148 |
 
-* The fisheye images keep their black border, which also counts in the PSNR.
-* The model renders pinhole images, so the fisheye PSNR compares a pinhole
-  render with a fisheye target.
-* RPA is far below DL3DV. `Data_hard` moves fast and turns a lot, and the
-  pose conversion from NED in the data loader has not been checked against a
-  second tool yet.
+* `Data_hard` moves fast. Over 40 frames the cameras of a pair turn by 23
+  degrees in the median and up to 89, far more than in DL3DV, and the pose
+  error grows with it. Over 10 frames the turn is 12 degrees in the median.
+* The poses from the data loader are right. Of the conventions we tried
+  (axes as in the loader, axes swapped the other way, no axis change, world to
+  camera instead of camera to world) the loader gives by far the best match
+  with the predictions.
+* RPA@5 stays low even on pinhole because of the translation direction. The
+  rotation alone is within 5 degrees for 79 % of the pairs.
+* The fisheye images keep their black border, which also counts in the PSNR,
+  and the model renders pinhole images, so the fisheye PSNR compares a
+  pinhole render with a fisheye target.
 
 `scripts/camera_head.py` shows the camera the model assumes for a sequence.
 On `ArchVizTinyHouseNight/Data_hard/P003` from `lcam_fish` it predicts
