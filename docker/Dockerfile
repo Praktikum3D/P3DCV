@@ -22,8 +22,17 @@ RUN pip install -r /tmp/requirements.txt
 # RTX 4090 (8.9), H200 (9.0). gsplat does not compile for anything older
 # (it needs cooperative_groups::labeled_partition), so the image cannot
 # render on the TITAN X / TITAN Xp nodes dortmund, jena and ulm.
-# GSPLAT_SOURCE can point to another gsplat, for example the 3DGEER extension
-# git+https://github.com/Praktikum3D/3dgeer.git@f15cee225206944e38acdd0ab4a7ab4e4aae78a1 (branch gsplat-geer).
-ARG GSPLAT_SOURCE="git+https://github.com/QitaoZhao/gsplat.git@daad91d9e667cf49bab815d872aa65a5cda0a77e"
+# GSPLAT_REPO and GSPLAT_REF can point to another gsplat, for example the 3DGEER
+# extension https://github.com/Praktikum3D/3dgeer.git at the head of branch
+# gsplat-geer (f15cee225206944e38acdd0ab4a7ab4e4aae78a1). That branch lists glm
+# as a submodule without committing it, so glm is cloned at the commit gsplat
+# 1.5.3 pins when it is missing.
+ARG GSPLAT_REPO=https://github.com/QitaoZhao/gsplat.git
+ARG GSPLAT_REF=daad91d9e667cf49bab815d872aa65a5cda0a77e
 ENV TORCH_CUDA_ARCH_LIST="7.5 8.6 8.9 9.0"
-RUN MAX_JOBS=4 pip install --no-build-isolation "$GSPLAT_SOURCE"
+RUN git clone "$GSPLAT_REPO" /tmp/gsplat && cd /tmp/gsplat && git checkout "$GSPLAT_REF" \
+    && git submodule update --init --recursive \
+    && GLM=gsplat/cuda/csrc/third_party/glm \
+    && if [ ! -f "$GLM/glm/glm.hpp" ]; then rm -rf "$GLM" && git clone https://github.com/g-truc/glm.git "$GLM" \
+        && git -C "$GLM" checkout 33b4a621a697a305bc3a7610d290677b96beb181; fi \
+    && MAX_JOBS=4 pip install --no-build-isolation . && cd / && rm -rf /tmp/gsplat
