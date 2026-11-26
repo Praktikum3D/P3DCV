@@ -36,7 +36,8 @@ def pixel_angles(fxfycxcy, h, w, camera_model):
     theta = camera_theta(rho, camera_model, alpha)
     valid = theta <= math.pi / 2
     if camera_model == "ucm":
-        valid = valid & (1 - (2 * alpha - 1) * rho**2 >= 0)
+        # The warp interpolates, so stay 1.5 px inside the 90 degree border where gsplat leaves background.
+        valid = (theta <= math.pi / 2 - 1.5 / fxfycxcy[:, 0, None, None]) & (1 - (2 * alpha - 1) * rho**2 >= 0)
     return dx, dy, radius, theta, valid
 
 

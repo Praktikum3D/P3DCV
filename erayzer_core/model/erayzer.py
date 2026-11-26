@@ -398,7 +398,7 @@ class ERayZer(nn.Module):
         pred_c2w = rearrange(pred_c2w, '(b v) n d -> b v n d', b=b)
         pred_fxfycxcy = rearrange(pred_fxfycxcy, '(b v) d -> b v d', b=b)
         if hasattr(self, "alpha_head"):  # UCM alpha as a fifth intrinsic, shared by the views of a scene
-            alpha = torch.sigmoid(self.alpha_head(rearrange(cam_tokens, '(b v) d -> b v d', b=b).mean(1)))
+            alpha = torch.sigmoid(self.alpha_head(rearrange(cam_tokens, '(b v) d -> b v d', b=b).mean(1)).float())  # bf16 would saturate at 1
             pred_fxfycxcy = torch.cat([pred_fxfycxcy, alpha[:, None].expand(-1, v_all, -1).to(pred_fxfycxcy)], dim=-1)
         if iter < self.freeze_focal_steps:
             pred_fxfycxcy = pred_fxfycxcy.detach()
