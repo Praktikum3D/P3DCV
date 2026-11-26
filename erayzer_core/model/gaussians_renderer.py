@@ -767,54 +767,43 @@ def render_opencv_cam_gsplat(
     }
 
 
-def _rotmat_to_quat(R):
-    """Rotation matrix [3, 3] to a unit quaternion (w, x, y, z), branch free so it stays differentiable."""
-    t = R[0, 0] + R[1, 1] + R[2, 2]
-    cands = torch.stack([
-        torch.stack([1 + t, R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]]),
-        torch.stack([R[2, 1] - R[1, 2], 1 + R[0, 0] - R[1, 1] - R[2, 2], R[0, 1] + R[1, 0], R[0, 2] + R[2, 0]]),
-        torch.stack([R[0, 2] - R[2, 0], R[0, 1] + R[1, 0], 1 - R[0, 0] + R[1, 1] - R[2, 2], R[1, 2] + R[2, 1]]),
-        torch.stack([R[1, 0] - R[0, 1], R[0, 2] + R[2, 0], R[1, 2] + R[2, 1], 1 - R[0, 0] - R[1, 1] + R[2, 2]]),
-    ])
-    q = cands[torch.argmax(torch.stack([t, R[0, 0], R[1, 1], R[2, 2]]))]
-    return q / q.norm()
-
-
-def _quat_multiply(a, b):
-    """Hamilton product of a [4] and b [N, 4], both (w, x, y, z)."""
-    aw, ax, ay, az = a
-    bw, bx, by, bz = b.unbind(-1)
-    return torch.stack([aw * bw - ax * bx - ay * by - az * bz, aw * bx + ax * bw + ay * bz - az * by,
-                        aw * by - ax * bz + ay * bw + az * bx, aw * bz + ax * by - ay * bx + az * bw], dim=-1)
-
-
 def render_opencv_cam_geer(pc, height, width, C2W, fxfycxcy, sh_degree, near_plane=0.01, camera_model="fisheye",
-                           radial_coeffs=None, bg_color=(1.0, 1.0, 1.0)):
+                           radial_coeffs=None, bg_color=(1.0, 1.0, 1.0), ray_camera_model=None):
     """Exact ray Gaussian rendering with 3DGEER (needs the gsplat-geer build of gsplat).
 
-    3DGEER returns no gradients for the cameras, so each view moves the Gaussians into its camera frame
-    here and renders from the origin, and evaluates the view dependent colors here as well. That way
-    autograd still reaches the poses. Fisheye is Kannala Brandt with radial_coeffs [v, 4] (zeros give
-    the equidistant model). Renders one view at a time, as 3DGEER requires.
+    The ray of every pixel is built here in PyTorch from C2W and fxfycxcy and handed to the rasterizer,
+    which gives gradients back for it. The camera model therefore lives entirely in PyTorch and autograd
+    reaches pose, focal length and the UCM alpha through the rays, so the Gaussians stay in world space
+    and the view matrix goes in detached. camera_model and radial_coeffs ("fisheye" is Kannala Brandt
+    with radial_coeffs [v, 4], zeros give the equidistant model) only describe the projection 3DGEER
+    uses to assign tiles and to cull, which is why UCM renders as a Kannala Brandt fisheye fitted to it;
+    ray_camera_model ("pinhole", "fisheye" or "ucm", defaults to camera_model) builds the real rays.
+    View dependent colors are evaluated here. Renders one view at a time, as 3DGEER requires.
     """
-    means, quats, scales = pc.get_xyz, pc.get_rotation, pc.get_scaling
-    opacity, shs = pc.get_opacity.squeeze(-1), pc.get_features.transpose(1, 2)  # [N], [N, 3, K]
-    W2C = C2W.inverse()
-    eye = torch.eye(4, device=C2W.device)[None]
-    bg = torch.tensor([bg_color], dtype=torch.float32, device=C2W.device)
-    renders = []
-    for j in range(C2W.shape[0]):
-        R, t = W2C[j, :3, :3], W2C[j, :3, 3]
-        dirs = torch.nn.functional.normalize(means - C2W[j, :3, 3], dim=-1)
-        colors = (eval_sh(sh_degree, shs, dirs) + 0.5).clamp_min(0.0)
-        K = torch.zeros(1, 3, 3, device=C2W.device)
-        K[0, 0, 0], K[0, 1, 1], K[0, 0, 2], K[0, 1, 2], K[0, 2, 2] = fxfycxcy[j, 0], fxfycxcy[j, 1], fxfycxcy[j, 2], fxfycxcy[j, 3], 1.0
-        out, _, _ = rasterization(
-            means @ R.T + t, _quat_multiply(_rotmat_to_quat(R), quats), scales, opacity, colors[None], eye, K,
-            width, height, near_plane=near_plane, packed=False, backgrounds=bg, camera_model=camera_model,
-            radial_coeffs=None if radial_coeffs is None else radial_coeffs[j:j + 1], with_geer=True, with_eval3d=True,
-        )
-        renders.append(out[0])
+    from .utils_gaussian import camera_rays  # here, because utils_gaussian imports this module
+
+    with torch.autocast(device_type=C2W.device.type, enabled=False):  # 3DGEER is float32 only
+        C2W, fxfycxcy = C2W.float(), fxfycxcy.float()
+        means, quats, scales = pc.get_xyz.float(), pc.get_rotation.float(), pc.get_scaling.float()
+        opacity, shs = pc.get_opacity.squeeze(-1).float(), pc.get_features.transpose(1, 2).float()  # [N], [N, 3, K]
+        bg = torch.tensor([bg_color], dtype=torch.float32, device=C2W.device)
+        W2C = C2W.inverse().detach()  # tile assignment only, the pose gradient comes from the rays
+        rays_o, rays_d = camera_rays(C2W, fxfycxcy, height, width, ray_camera_model or camera_model)
+        renders = []
+        for j in range(C2W.shape[0]):
+            dirs = torch.nn.functional.normalize(means - C2W[j, :3, 3], dim=-1)
+            colors = (eval_sh(sh_degree, shs, dirs) + 0.5).clamp_min(0.0)
+            K = torch.zeros(1, 3, 3, device=C2W.device)
+            f = fxfycxcy[j].detach()  # tile assignment only, the focal length gradient comes from the rays
+            K[0, 0, 0], K[0, 1, 1], K[0, 0, 2], K[0, 1, 2], K[0, 2, 2] = f[0], f[1], f[2], f[3], 1.0
+            out, _, _ = rasterization(
+                means, quats, scales, opacity, colors[None], W2C[j:j + 1], K,
+                width, height, near_plane=near_plane, packed=False, backgrounds=bg, camera_model=camera_model,
+                radial_coeffs=None if radial_coeffs is None else radial_coeffs[j:j + 1].float().detach(),
+                with_geer=True, with_eval3d=True,
+                rays_o=rays_o[j:j + 1].contiguous(), rays_d=rays_d[j:j + 1].contiguous(),
+            )
+            renders.append(out[0])
     return {"render": torch.stack(renders).permute(0, 3, 1, 2), "depth": None}
 
 

@@ -22,6 +22,31 @@ def camera_theta(rho, camera_model, alpha=None):
     return rho if camera_model == "fisheye" else torch.atan(rho)
 
 
+def camera_rays(c2w, fxfycxcy, h, w, camera_model="pinhole"):
+    """Ray origins and normalized directions in world space for every pixel, both [b, h, w, 3].
+
+    c2w [b, 4, 4], fxfycxcy [b, 4] in pixels, for UCM [b, 5] with alpha last. This is the ray math of
+    cam_info_to_plucker, kept in one place so the plucker embeddings and the 3DGEER renderer agree.
+    """
+    b = c2w.shape[0]
+    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+    y, x = y.to(c2w), x.to(c2w)
+    x = x[None, :, :].expand(b, -1, -1).reshape(b, -1)
+    y = y[None, :, :].expand(b, -1, -1).reshape(b, -1)
+    x = (x + 0.5 - fxfycxcy[:, 2:3]) / fxfycxcy[:, 0:1]
+    y = (y + 0.5 - fxfycxcy[:, 3:4]) / fxfycxcy[:, 1:2]
+    z = torch.ones_like(x)
+    if camera_model != "pinhole":  # fisheye or UCM, direction from the angle to the optical axis
+        rho = torch.sqrt(x * x + y * y + 1e-12)
+        theta = camera_theta(rho, camera_model, fxfycxcy[:, 4:5] if camera_model == "ucm" else None)
+        x, y, z = x * torch.sin(theta) / rho, y * torch.sin(theta) / rho, torch.cos(theta)
+    ray_d = torch.stack([x, y, z], dim=2)  # [b, h*w, 3]
+    ray_d = torch.bmm(ray_d, c2w[:, :3, :3].transpose(1, 2))  # [b, h*w, 3]
+    ray_d = ray_d / torch.norm(ray_d, dim=2, keepdim=True)  # [b, h*w, 3]
+    ray_o = c2w[:, :3, 3][:, None, :].expand_as(ray_d)  # [b, h*w, 3]
+    return ray_o.reshape(b, h, w, 3), ray_d.reshape(b, h, w, 3)
+
+
 def pixel_angles(fxfycxcy, h, w, camera_model, exact=False):
     """Offsets dx, dy from the principal point, their radius, the angle to the optical axis and the pixels
     the camera can render, all [n, h, w]. fxfycxcy [n, 4] in pixels, for UCM [n, 5] with alpha last.
@@ -145,6 +170,7 @@ class Renderer(nn.Module):
                         buffers = render_opencv_cam_geer(
                             pc, height, width, C2W[i], fxfycxcy[i], self.sh_degree, near_plane=near_plane,
                             camera_model="pinhole" if camera_model == "pinhole" else "fisheye", radial_coeffs=radial,
+                            ray_camera_model=camera_model,
                         )
                     elif camera_model == "ucm":
                         # gsplat has no UCM. Render an equidistant fisheye image whose focal length keeps every

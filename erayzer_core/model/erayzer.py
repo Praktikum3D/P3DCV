@@ -15,7 +15,7 @@ from .utils_transformer import (
 from utils import camera_utils
 from .utils_pe import get_2d_sincos_pos_embed
 from .utils_rot import rot6d2mat, quat2mat
-from .utils_gaussian import get_point_range_func, Renderer, camera_theta
+from .utils_gaussian import get_point_range_func, Renderer, camera_rays
 from .utils_vis import build_stepback_c2ws
 
 
@@ -836,25 +836,10 @@ def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return
         fxfycxcy[:, 2] *= w
         fxfycxcy[:, 3] *= h
 
-    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
-    y, x = y.to(c2w), x.to(c2w)
-    x = x[None, :, :].expand(b, -1, -1).reshape(b, -1)
-    y = y[None, :, :].expand(b, -1, -1).reshape(b, -1)
-    x = (x + 0.5 - fxfycxcy[:, 2:3]) / fxfycxcy[:, 0:1]
-    y = (y + 0.5 - fxfycxcy[:, 3:4]) / fxfycxcy[:, 1:2]
-    z = torch.ones_like(x)
-    if camera_model != "pinhole":  # fisheye or UCM, direction from the angle to the optical axis
-        rho = torch.sqrt(x * x + y * y + 1e-12)
-        theta = camera_theta(rho, camera_model, fxfycxcy[:, 4:5] if camera_model == "ucm" else None)
-        x, y, z = x * torch.sin(theta) / rho, y * torch.sin(theta) / rho, torch.cos(theta)
-    ray_d = torch.stack([x, y, z], dim=2)  # [b, h*w, 3]
-    ray_d = torch.bmm(ray_d, c2w[:, :3, :3].transpose(1, 2))  # [b, h*w, 3]
-    ray_d = ray_d / torch.norm(ray_d, dim=2, keepdim=True)  # [b, h*w, 3]
-    ray_o = c2w[:, :3, 3][:, None, :].expand_as(ray_d)  # [b, h*w, 3]
+    ray_o, ray_d = camera_rays(c2w, fxfycxcy, h, w, camera_model)  # [b,h,w,3] each
+    ray_o = ray_o.permute(0, 3, 1, 2)   # [b,3,h,w]
+    ray_d = ray_d.permute(0, 3, 1, 2)
 
-    ray_o = ray_o.reshape(b, h, w, 3).permute(0, 3, 1, 2)   # [b,3,h,w]
-    ray_d = ray_d.reshape(b, h, w, 3).permute(0, 3, 1, 2)
-    
     if return_moment:
         plucker = torch.cat(
             [
