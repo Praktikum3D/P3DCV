@@ -835,7 +835,7 @@ def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return
     y = (y + 0.5 - fxfycxcy[:, 3:4]) / fxfycxcy[:, 1:2]
     z = torch.ones_like(x)
     if camera_model == "fisheye":  # equidistant, angle to the optical axis = distance from the center / f
-        theta = torch.sqrt(x * x + y * y).clamp_min(1e-6)
+        theta = torch.sqrt(x * x + y * y + 1e-12)
         x, y, z = x * torch.sin(theta) / theta, y * torch.sin(theta) / theta, torch.cos(theta)
     ray_d = torch.stack([x, y, z], dim=2)  # [b, h*w, 3]
     ray_d = torch.bmm(ray_d, c2w[:, :3, :3].transpose(1, 2))  # [b, h*w, 3]

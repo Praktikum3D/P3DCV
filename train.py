@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import erayzer_core  # noqa: F401  # registers model.* and utils.* aliases
 from erayzer_core.losses import PerceptualLoss
+from erayzer_core.model.utils_gaussian import camera_theta, render_mask
 from training.datasets import build_dataset as build_config_dataset
 
 
@@ -253,14 +254,13 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
         ).reshape(b, v, target.shape[2], pred.shape[-2], pred.shape[-1])
 
     inside = 1.0
-    if config.model.get("camera_model", "pinhole") == "fisheye":
-        # Only pixels inside the image circle (full width in TartanAir) and within 90 degrees
-        # of the optical axis count; gsplat drops everything behind the camera plane.
-        h, w = pred.shape[-2:]
-        yy, xx = torch.meshgrid(torch.arange(h, device=pred.device), torch.arange(w, device=pred.device), indexing="ij")
-        radius = torch.sqrt((xx + 0.5 - w / 2) ** 2 + (yy + 0.5 - h / 2) ** 2)
-        limit = (result.fxfycxcy_target[..., 0].detach().float() * math.pi / 2).clamp(max=w / 2)
-        mask = (radius <= limit[..., None, None, None]).to(pred.dtype)
+    camera_model = config.model.get("camera_model", "pinhole")
+    if camera_model != "pinhole":
+        # Only pixels the camera can render count, for fisheye data only inside the image circle.
+        b, v, _, h, w = pred.shape
+        fxfycxcy = result.fxfycxcy_target.detach().float().reshape(b * v, -1)
+        mask = render_mask(fxfycxcy, h, w, camera_model, "fish" in str(config.dataset.get("camera_name", "")))
+        mask = mask.reshape(b, v, 1, h, w).to(pred.dtype)
         pred, inside = pred * mask + target * (1 - mask), max(mask.mean().item(), 1e-3)
     mse = F.mse_loss(pred, target) / inside
     l1 = F.l1_loss(pred, target) / inside
@@ -281,6 +281,7 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
         l1=l1.detach(),
         perceptual=perceptual.detach(),
         psnr=psnr.detach(),
+        mask_fraction=pred.new_tensor(inside),
     )
 
 
@@ -340,10 +341,7 @@ def init_wandb(config: edict, rank: int):
 def camera_stats(result: edict, camera_model: str) -> Dict[str, float]:
     """Mean predicted focal length (normalized by image width) and the FOV across the image width."""
     fx = result.fxfycxcy[:, 0].detach().float()
-    if camera_model == "fisheye":
-        fov = 2.0 * 0.5 / fx.clamp_min(1e-6)
-    else:
-        fov = 2.0 * torch.atan(0.5 / fx.clamp_min(1e-6))
+    fov = 2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), camera_model)
     return {
         "camera/fx_norm": fx.mean().item(),
         "camera/fov_deg": math.degrees(fov.mean().item()),
@@ -441,6 +439,7 @@ def main() -> None:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
+    nonfinite_skips = 0
     wandb_run = init_wandb(config, rank)
     vis_every = int(config.training.get("vis_every", 500))
 
@@ -497,10 +496,13 @@ def main() -> None:
                 no_pass_steps = int(config.training.get("no_pass_steps", 10))
                 # A NaN norm compares False above the limit, so skip non-finite gradients explicitly.
                 skip_optimizer_step = bool(not torch.isfinite(grad_norm) or (grad_norm > allowed_gradnorm and (step + 1) > no_pass_steps))
+                nonfinite_skips = 0 if torch.isfinite(grad_norm) else nonfinite_skips + 1
+                if nonfinite_skips >= 20:
+                    raise RuntimeError(f"20 consecutive non-finite gradients at step {step + 1}")
                 if skip_optimizer_step and is_rank0(rank):
                     print(
-                        f"WARNING: step {step + 1} grad norm too large "
-                        f"{float(grad_norm):.6f} > {allowed_gradnorm:.6f}, skipping optimizer step"
+                        f"WARNING: step {step + 1} grad norm {float(grad_norm):.6f} "
+                        f"(limit {allowed_gradnorm:.6f}), skipping optimizer step"
                     )
                 if not skip_optimizer_step:
                     scaler.step(optimizer)
@@ -537,6 +539,7 @@ def main() -> None:
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/grad_norm": float(grad_norm),
                         "train/param_update_step": param_update_step,
+                        "train/mask_fraction": metrics.mask_fraction.item(),
                         **camera_stats(result, config.model.get("camera_model", "pinhole")),
                     }
                     wandb_run.log(log_data, step=step)

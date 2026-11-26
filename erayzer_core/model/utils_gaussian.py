@@ -1,4 +1,6 @@
 
+import math
+
 import torch
 import torch.nn as nn
 from easydict import EasyDict as edict
@@ -8,6 +10,25 @@ from .gaussians_renderer import (
     render_opencv_cam_gsplat,
     deferred_gaussian_render,
 )
+
+
+def camera_theta(rho, camera_model):
+    """Angle to the optical axis for the image radius rho divided by f."""
+    return rho if camera_model == "fisheye" else torch.atan(rho)
+
+
+def render_mask(fxfycxcy, h, w, camera_model, image_circle=False):
+    """Pixels the camera model can render, [n, 1, h, w]. fxfycxcy [n, 4] in pixels.
+
+    gsplat drops everything behind the camera plane (more than 90 degrees off axis). With image_circle
+    only the circle spanning the image width counts (fisheye data such as TartanAir lcam_fish).
+    """
+    y, x = torch.meshgrid(torch.arange(h, device=fxfycxcy.device), torch.arange(w, device=fxfycxcy.device), indexing="ij")
+    radius = torch.sqrt((x + 0.5 - fxfycxcy[:, 2, None, None]) ** 2 + (y + 0.5 - fxfycxcy[:, 3, None, None]) ** 2)
+    valid = camera_theta(radius / fxfycxcy[:, 0, None, None], camera_model) <= math.pi / 2
+    if image_circle:
+        valid = valid & (radius <= w / 2)
+    return valid[:, None].float()
 
 
 class Renderer(nn.Module):
@@ -45,6 +66,9 @@ class Renderer(nn.Module):
 
         output: [b, v, 3, height, width]
         """
+        if self.config.model.get("camera_model", "pinhole") != "pinhole":
+            assert self.config.model.get("use_gsplat", True) and not self.config.model.get("use_deferred_rendering", False), \
+                "camera models other than pinhole need the gsplat renderer"
 
         # if deferred:
         if self.config.model.get("use_deferred_rendering", False):

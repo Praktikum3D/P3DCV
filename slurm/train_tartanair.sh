@@ -46,6 +46,12 @@ CAMERA_MODEL="${CAMERA_MODEL:-pinhole}"
 if [[ "$CAMERA_MODEL" == fisheye ]]; then F_SCALE="${F_SCALE:-0.26}" NEAR="${NEAR:-0.01}"; else F_SCALE="${F_SCALE:-1.0}" NEAR="${NEAR:-0.2}"; fi
 
 mkdir -p "$RUN_DIR"
+# The camera settings are not stored in the checkpoint, so a resumed run must use the same ones.
+SAVED_MODEL="$(sed -n 's/^ *camera_model: *//p' "$RUN_DIR/config.yaml" 2>/dev/null | head -n 1)"
+if [[ -f "$RUN_DIR/config.yaml" && "${SAVED_MODEL:-pinhole}" != "$CAMERA_MODEL" ]]; then
+    echo "CAMERA_MODEL=$CAMERA_MODEL differs from $RUN_DIR/config.yaml, use the same one or a new RUN_NAME" >&2
+    exit 1
+fi
 
 prune_checkpoints() {
     { ls -1 "$RUN_DIR"/ckpt_*.pt 2>/dev/null || true; } | sort | head -n "-$KEEP_CKPTS" | xargs -r rm -f --
