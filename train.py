@@ -254,10 +254,13 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
 
     inside = 1.0
     if config.model.get("camera_model", "pinhole") == "fisheye":
-        # Only pixels inside the image circle count; it spans the full width (TartanAir).
+        # Only pixels inside the image circle (full width in TartanAir) and within 90 degrees
+        # of the optical axis count; gsplat drops everything behind the camera plane.
         h, w = pred.shape[-2:]
         yy, xx = torch.meshgrid(torch.arange(h, device=pred.device), torch.arange(w, device=pred.device), indexing="ij")
-        mask = ((xx + 0.5 - w / 2) ** 2 + (yy + 0.5 - h / 2) ** 2 <= (w / 2) ** 2).to(pred.dtype)
+        radius = torch.sqrt((xx + 0.5 - w / 2) ** 2 + (yy + 0.5 - h / 2) ** 2)
+        limit = (result.fxfycxcy_target[..., 0].detach().float() * math.pi / 2).clamp(max=w / 2)
+        mask = (radius <= limit[..., None, None, None]).to(pred.dtype)
         pred, inside = pred * mask + target * (1 - mask), mask.mean().item()
     mse = F.mse_loss(pred, target) / inside
     l1 = F.l1_loss(pred, target) / inside

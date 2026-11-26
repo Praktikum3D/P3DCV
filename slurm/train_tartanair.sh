@@ -41,7 +41,8 @@ VIS_EVERY="${VIS_EVERY:-500}"
 # Camera model for rays and rendering: pinhole or fisheye (equidistant).
 # The fisheye f_bias puts the initial focal length of erayzer_multi.pt near 195 degrees.
 CAMERA_MODEL="${CAMERA_MODEL:-pinhole}"
-if [[ "$CAMERA_MODEL" == fisheye ]]; then F_BIAS="${F_BIAS:-0.41}"; else F_BIAS="${F_BIAS:-1.25}"; fi
+# A small near plane keeps fisheye content close to 90 degrees from being dropped.
+if [[ "$CAMERA_MODEL" == fisheye ]]; then F_BIAS="${F_BIAS:-0.41}" NEAR="${NEAR:-0.01}"; else F_BIAS="${F_BIAS:-1.25}" NEAR="${NEAR:-0.2}"; fi
 
 mkdir -p "$RUN_DIR"
 
@@ -87,6 +88,7 @@ EXTRA_ARGS=(
     -s training.vis_every "$VIS_EVERY"
     -s model.camera_model "$CAMERA_MODEL"
     -s model.f_bias "$F_BIAS"
+    -s model.near_plane "$NEAR"
     "$@"
 )
 if [[ -n "$WANDB_PROJECT" ]]; then
