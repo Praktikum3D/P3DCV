@@ -97,7 +97,7 @@ EXTRA_ARGS=(
     -s model.camera_model "$CAMERA_MODEL"
     -s model.f_scale "$F_SCALE"
     -s model.near_plane "$NEAR"
-    -s model.alpha_init "${ALPHA_INIT:-0.5}"
+    -s model.alpha_init "${ALPHA_INIT:-0.62}"
     "$@"
 )
 if [[ -n "$WANDB_PROJECT" ]]; then
