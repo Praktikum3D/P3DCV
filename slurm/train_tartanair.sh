@@ -33,6 +33,11 @@ LR="${LR:-0.0001}"
 WARMUP="${WARMUP:-500}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-1000}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+# Weights & Biases logging. Set WANDB_PROJECT= (empty) to turn it off.
+# The key file holds one line WANDB_API_KEY=... and should be readable only by you.
+WANDB_PROJECT="${WANDB_PROJECT-p3dcv}"
+WANDB_KEY_FILE="${WANDB_KEY_FILE:-/mnt/home/$USER/.secrets/wandb.env}"
+VIS_EVERY="${VIS_EVERY:-500}"
 
 mkdir -p "$RUN_DIR"
 
@@ -75,8 +80,17 @@ EXTRA_ARGS=(
     -s training.checkpoint_every "$CHECKPOINT_EVERY"
     -s training.num_workers "$NUM_WORKERS"
     -s training.perceptual_loss_weight_path "$PRETRAINED_DIR/imagenet-vgg-verydeep-19.mat"
+    -s training.vis_every "$VIS_EVERY"
     "$@"
 )
+if [[ -n "$WANDB_PROJECT" ]]; then
+    EXTRA_ARGS=(
+        -s training.wandb_project "$WANDB_PROJECT"
+        -s training.wandb_run_name "$RUN_NAME"
+        -s training.wandb_key_file "$WANDB_KEY_FILE"
+        "${EXTRA_ARGS[@]}"
+    )
+fi
 
 in_container bash -c "cd '$REPO_DIR' && torchrun --standalone --nproc_per_node 1 train.py \
     --config config/erayzer_train_tartanair.yaml $(printf '%q ' "${EXTRA_ARGS[@]}")"

@@ -299,6 +299,55 @@ def save_checkpoint(
     )
 
 
+def init_wandb(config: edict, rank: int):
+    """Start a Weights & Biases run if training.wandb_project is set, else return None."""
+    project = config.training.get("wandb_project")
+    if not is_rank0(rank) or not project:
+        return None
+    key_file = config.training.get("wandb_key_file")
+    if key_file and not os.environ.get("WANDB_API_KEY"):
+        with open(os.path.expanduser(str(key_file)), "r", encoding="utf-8") as handle:
+            for line in handle:
+                name, _, value = line.strip().partition("=")
+                if name == "WANDB_API_KEY" and value:
+                    os.environ["WANDB_API_KEY"] = value.strip().strip("\"'")
+    import wandb
+
+    checkpoint_dir = os.path.abspath(config.training.checkpoint_dir)
+    run_name = config.training.get("wandb_run_name") or os.path.basename(checkpoint_dir)
+    # A fixed id per checkpoint folder makes a resumed job continue the same run.
+    run_id = config.training.get("wandb_run_id") or run_name
+    return wandb.init(
+        project=str(project),
+        name=str(run_name),
+        id=str(run_id),
+        resume="allow",
+        dir=checkpoint_dir,
+        config=_to_plain(config),
+    )
+
+
+def camera_stats(result: edict) -> Dict[str, float]:
+    """Mean predicted focal length (normalized by image width) and the pinhole FOV it implies."""
+    fx = result.fxfycxcy[:, 0].detach().float()
+    fov = 2.0 * torch.atan(0.5 / fx.clamp_min(1e-6))
+    return {
+        "camera/fx_norm": fx.mean().item(),
+        "camera/fov_deg": math.degrees(fov.mean().item()),
+    }
+
+
+def render_grid(result: edict) -> np.ndarray:
+    """First sample of the batch: target views on top, rendered views below, as HxWx3 uint8."""
+    pred = result.render[0].detach().float().clamp(0.0, 1.0)
+    target = result.target_image[0].detach().float().clamp(0.0, 1.0)
+    if target.shape[-2:] != pred.shape[-2:]:
+        target = F.interpolate(target, size=pred.shape[-2:], mode="bilinear", align_corners=False)
+    rows = [torch.cat(list(views), dim=-1) for views in (target, pred)]
+    grid = torch.cat(rows, dim=-2)
+    return (grid.permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", "-c", required=True)
@@ -379,6 +428,8 @@ def main() -> None:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
+    wandb_run = init_wandb(config, rank)
+    vis_every = int(config.training.get("vis_every", 500))
 
     while step < max_steps:
         if hasattr(dataset, "update_iteration"):
@@ -462,6 +513,27 @@ def main() -> None:
                     f"grad_norm={float(grad_norm):.3f} "
                     f"time={elapsed:.1f}s"
                 )
+                if wandb_run is not None:
+                    log_data = {
+                        "train/loss": metrics.loss.item(),
+                        "train/mse": metrics.mse.item(),
+                        "train/l1": metrics.l1.item(),
+                        "train/perceptual": metrics.perceptual.item(),
+                        "train/psnr": metrics.psnr.item(),
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/grad_norm": float(grad_norm),
+                        "train/param_update_step": param_update_step,
+                        **camera_stats(result),
+                    }
+                    wandb_run.log(log_data, step=step)
+
+            if wandb_run is not None and vis_every > 0 and (step == 1 or step % vis_every == 0):
+                import wandb
+
+                wandb_run.log(
+                    {"render/target_top_pred_bottom": wandb.Image(render_grid(result), caption=f"step {step}")},
+                    step=step,
+                )
 
             if is_rank0(rank) and step % int(config.training.get("checkpoint_every", 2000)) == 0:
                 save_checkpoint(
@@ -487,6 +559,8 @@ def main() -> None:
             param_update_step,
             config,
         )
+    if wandb_run is not None:
+        wandb_run.finish()
     cleanup_distributed()
 
 
