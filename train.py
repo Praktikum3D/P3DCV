@@ -259,7 +259,8 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
         # Only pixels the camera can render count, for fisheye data only inside the image circle.
         b, v, _, h, w = pred.shape
         fxfycxcy = result.fxfycxcy_target.detach().float().reshape(b * v, -1)
-        mask = render_mask(fxfycxcy, h, w, camera_model, "fish" in str(config.dataset.get("camera_name", "")))
+        mask = render_mask(fxfycxcy, h, w, camera_model, "fish" in str(config.dataset.get("camera_name", "")),
+                           exact=config.model.get("renderer", "gsplat") == "geer")
         mask = mask.reshape(b, v, 1, h, w).to(pred.dtype)
         pred, inside = pred * mask + target * (1 - mask), max(mask.mean().item(), 1e-3)
     mse = F.mse_loss(pred, target) / inside

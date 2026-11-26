@@ -98,6 +98,7 @@ EXTRA_ARGS=(
     -s model.f_scale "$F_SCALE"
     -s model.near_plane "$NEAR"
     -s model.alpha_init "${ALPHA_INIT:-0.62}"
+    -s model.renderer "${RENDERER:-gsplat}"
     "$@"
 )
 if [[ -n "$WANDB_PROJECT" ]]; then

@@ -8,6 +8,7 @@ from easydict import EasyDict as edict
 
 from .gaussians_renderer import (
     GaussianModel,
+    render_opencv_cam_geer,
     render_opencv_cam_gsplat,
     deferred_gaussian_render,
 )
@@ -21,12 +22,12 @@ def camera_theta(rho, camera_model, alpha=None):
     return rho if camera_model == "fisheye" else torch.atan(rho)
 
 
-def pixel_angles(fxfycxcy, h, w, camera_model):
+def pixel_angles(fxfycxcy, h, w, camera_model, exact=False):
     """Offsets dx, dy from the principal point, their radius, the angle to the optical axis and the pixels
     the camera can render, all [n, h, w]. fxfycxcy [n, 4] in pixels, for UCM [n, 5] with alpha last.
 
-    gsplat drops everything behind the camera plane (more than 90 degrees off axis), and UCM is undefined
-    outside its own image circle.
+    gsplat drops everything behind the camera plane (more than 90 degrees off axis), the exact 3DGEER
+    renderer does not. UCM is undefined outside its own image circle.
     """
     y, x = torch.meshgrid(torch.arange(h, device=fxfycxcy.device), torch.arange(w, device=fxfycxcy.device), indexing="ij")
     dx, dy = x + 0.5 - fxfycxcy[:, 2, None, None], y + 0.5 - fxfycxcy[:, 3, None, None]
@@ -34,21 +35,34 @@ def pixel_angles(fxfycxcy, h, w, camera_model):
     rho = radius / fxfycxcy[:, 0, None, None]
     alpha = fxfycxcy[:, 4, None, None] if camera_model == "ucm" else None
     theta = camera_theta(rho, camera_model, alpha)
-    valid = theta <= math.pi / 2
+    valid = theta <= (math.pi if exact else math.pi / 2)
     if camera_model == "ucm":
-        # The warp interpolates, so stay 1.5 px inside the 90 degree border where gsplat leaves background.
-        valid = (theta <= math.pi / 2 - 1.5 / fxfycxcy[:, 0, None, None]) & (1 - (2 * alpha - 1) * rho**2 >= 0)
+        # The gsplat warp interpolates, so stay 1.5 px inside the 90 degree border where gsplat leaves background.
+        margin = 0.0 if exact else 1.5 / fxfycxcy[:, 0, None, None]
+        valid = (theta <= (math.pi if exact else math.pi / 2) - margin) & (1 - (2 * alpha - 1) * rho**2 >= 0)
     return dx, dy, radius, theta, valid
 
 
-def render_mask(fxfycxcy, h, w, camera_model, image_circle=False):
+def render_mask(fxfycxcy, h, w, camera_model, image_circle=False, exact=False):
     """Pixels the camera model can render, [n, 1, h, w]. With image_circle only the circle spanning the
     image width counts (fisheye data such as TartanAir lcam_fish).
     """
-    _, _, radius, _, valid = pixel_angles(fxfycxcy, h, w, camera_model)
+    _, _, radius, _, valid = pixel_angles(fxfycxcy, h, w, camera_model, exact)
     if image_circle:
         valid = valid & (radius <= w / 2)
     return valid[:, None].float()
+
+
+def ucm_radial_coeffs(fxfycxcy, h, w):
+    """Kannala Brandt coefficients [v, 4] that reproduce UCM (alpha in column 4) up to the largest valid angle,
+    by least squares on theta_d / theta - 1 = k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8."""
+    _, _, _, theta, valid = pixel_angles(fxfycxcy, h, w, "ucm", exact=True)
+    theta_max = torch.where(valid, theta, torch.zeros_like(theta)).flatten(1).amax(1)  # [v]
+    th = theta_max[:, None] * torch.linspace(0.02, 1.0, 64, device=theta.device)[None]  # [v, 64]
+    a = fxfycxcy[:, 4:5]
+    target = torch.sin(th) / (a + (1 - a) * torch.cos(th)) / th - 1
+    A = torch.stack([th**2, th**4, th**6, th**8], dim=-1)  # [v, 64, 4]
+    return torch.linalg.lstsq(A.double(), target.double()[..., None]).solution[..., 0].float()
 
 
 class Renderer(nn.Module):
@@ -122,7 +136,17 @@ class Renderer(nn.Module):
                 if self.config.model.get("use_gsplat", True): # False
                     near_plane = self.config.model.get("near_plane", 0.2)
                     camera_model = self.config.model.get("camera_model", "pinhole")
-                    if camera_model == "ucm":
+                    if self.config.model.get("renderer", "gsplat") == "geer":
+                        radial = None
+                        if camera_model == "ucm":  # 3DGEER has no UCM, a fitted Kannala Brandt fisheye replaces it
+                            radial = ucm_radial_coeffs(fxfycxcy[i].detach(), height, width)
+                        elif camera_model == "fisheye":
+                            radial = torch.zeros(fxfycxcy.shape[1], 4, device=xyz.device)
+                        buffers = render_opencv_cam_geer(
+                            pc, height, width, C2W[i], fxfycxcy[i], self.sh_degree, near_plane=near_plane,
+                            camera_model="pinhole" if camera_model == "pinhole" else "fisheye", radial_coeffs=radial,
+                        )
+                    elif camera_model == "ucm":
                         # gsplat has no UCM. Render an equidistant fisheye image whose focal length keeps every
                         # valid pixel inside it, then look up each UCM pixel by its angle to the optical axis.
                         dx, dy, radius, theta, valid = pixel_angles(fxfycxcy[i], height, width, "ucm")
