@@ -341,11 +341,12 @@ def init_wandb(config: edict, rank: int):
 def camera_stats(result: edict, camera_model: str) -> Dict[str, float]:
     """Mean predicted focal length (normalized by image width) and the FOV across the image width."""
     fx = result.fxfycxcy[:, 0].detach().float()
-    fov = 2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), camera_model)
-    return {
-        "camera/fx_norm": fx.mean().item(),
-        "camera/fov_deg": math.degrees(fov.mean().item()),
-    }
+    alpha = result.fxfycxcy[:, 4].detach().float() if camera_model == "ucm" else None
+    fov = 2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), camera_model, alpha)
+    stats = {"camera/fx_norm": fx.mean().item(), "camera/fov_deg": math.degrees(fov.mean().item())}
+    if alpha is not None:
+        stats["camera/alpha"] = alpha.mean().item()
+    return stats
 
 
 def render_grid(result: edict) -> np.ndarray:

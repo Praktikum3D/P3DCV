@@ -15,7 +15,7 @@ from .utils_transformer import (
 from utils import camera_utils
 from .utils_pe import get_2d_sincos_pos_embed
 from .utils_rot import rot6d2mat, quat2mat
-from .utils_gaussian import get_point_range_func, Renderer
+from .utils_gaussian import get_point_range_func, Renderer, camera_theta
 from .utils_vis import build_stepback_c2ws
 
 
@@ -217,6 +217,12 @@ class ERayZer(nn.Module):
 
         # pose predictor
         self.pose_predictor = PoseEstimator(self.config)
+        if self.config.model.get("camera_model", "pinhole") == "ucm":
+            # UCM alpha per scene, starts at alpha_init and stays in (0, 1).
+            self.alpha_head = nn.Linear(self.config.model.transformer.d, 1)
+            nn.init.zeros_(self.alpha_head.weight)
+            a0 = float(self.config.model.get("alpha_init", 0.5))
+            nn.init.constant_(self.alpha_head.bias, math.log(a0 / (1 - a0)))
         
         # input pose tokenizer
         self.input_pose_tokenizer = nn.Sequential(
@@ -391,6 +397,9 @@ class ERayZer(nn.Module):
         pred_c2w, pred_fxfycxcy = get_cam_se3(cam_info) # [b*v_all, 4, 4], [b*v_all, 4]
         pred_c2w = rearrange(pred_c2w, '(b v) n d -> b v n d', b=b)
         pred_fxfycxcy = rearrange(pred_fxfycxcy, '(b v) d -> b v d', b=b)
+        if hasattr(self, "alpha_head"):  # UCM alpha as a fifth intrinsic, shared by the views of a scene
+            alpha = torch.sigmoid(self.alpha_head(rearrange(cam_tokens, '(b v) d -> b v d', b=b).mean(1)))
+            pred_fxfycxcy = torch.cat([pred_fxfycxcy, alpha[:, None].expand(-1, v_all, -1).to(pred_fxfycxcy)], dim=-1)
         if iter < self.freeze_focal_steps:
             pred_fxfycxcy = pred_fxfycxcy.detach()
         normalized = True
@@ -728,7 +737,7 @@ class ERayZer(nn.Module):
                         c2ws[:, :3, :4], Ks, num_frames, order_poses=order_poses
                     )
                     frame_c2ws = torch.cat([c2ws.to(device), torch.tensor([[[0, 0, 0, 1]]], device=device).repeat(c2ws.shape[0], 1, 1)], dim=1)    # [v',4,4]
-                    frame_fxfycxcy = torch.zeros((c2ws.shape[0], 4), device=device)
+                    frame_fxfycxcy = fxfycxcy[:1].repeat(c2ws.shape[0], 1)  # keeps the UCM alpha column
                     frame_fxfycxcy[:, 0] = Ks[:, 0, 0]      # [v',4]
                     frame_fxfycxcy[:, 1] = Ks[:, 1, 1]
                     frame_fxfycxcy[:, 2] = Ks[:, 0, 2]
@@ -834,9 +843,10 @@ def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return
     x = (x + 0.5 - fxfycxcy[:, 2:3]) / fxfycxcy[:, 0:1]
     y = (y + 0.5 - fxfycxcy[:, 3:4]) / fxfycxcy[:, 1:2]
     z = torch.ones_like(x)
-    if camera_model == "fisheye":  # equidistant, angle to the optical axis = distance from the center / f
-        theta = torch.sqrt(x * x + y * y + 1e-12)
-        x, y, z = x * torch.sin(theta) / theta, y * torch.sin(theta) / theta, torch.cos(theta)
+    if camera_model != "pinhole":  # fisheye or UCM, direction from the angle to the optical axis
+        rho = torch.sqrt(x * x + y * y + 1e-12)
+        theta = camera_theta(rho, camera_model, fxfycxcy[:, 4:5] if camera_model == "ucm" else None)
+        x, y, z = x * torch.sin(theta) / rho, y * torch.sin(theta) / rho, torch.cos(theta)
     ray_d = torch.stack([x, y, z], dim=2)  # [b, h*w, 3]
     ray_d = torch.bmm(ray_d, c2w[:, :3, :3].transpose(1, 2))  # [b, h*w, 3]
     ray_d = ray_d / torch.norm(ray_d, dim=2, keepdim=True)  # [b, h*w, 3]
