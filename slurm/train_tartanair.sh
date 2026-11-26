@@ -38,6 +38,10 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 WANDB_PROJECT="${WANDB_PROJECT-p3dcv}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-/mnt/home/$USER/.secrets/wandb.env}"
 VIS_EVERY="${VIS_EVERY:-500}"
+# Camera model for rays and rendering: pinhole or fisheye (equidistant).
+# The fisheye f_bias puts the initial focal length of erayzer_multi.pt near 195 degrees.
+CAMERA_MODEL="${CAMERA_MODEL:-pinhole}"
+if [[ "$CAMERA_MODEL" == fisheye ]]; then F_BIAS="${F_BIAS:-0.41}"; else F_BIAS="${F_BIAS:-1.25}"; fi
 
 mkdir -p "$RUN_DIR"
 
@@ -81,6 +85,8 @@ EXTRA_ARGS=(
     -s training.num_workers "$NUM_WORKERS"
     -s training.perceptual_loss_weight_path "$PRETRAINED_DIR/imagenet-vgg-verydeep-19.mat"
     -s training.vis_every "$VIS_EVERY"
+    -s model.camera_model "$CAMERA_MODEL"
+    -s model.f_bias "$F_BIAS"
     "$@"
 )
 if [[ -n "$WANDB_PROJECT" ]]; then

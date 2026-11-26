@@ -252,8 +252,15 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
             align_corners=False,
         ).reshape(b, v, target.shape[2], pred.shape[-2], pred.shape[-1])
 
-    mse = F.mse_loss(pred, target)
-    l1 = F.l1_loss(pred, target)
+    inside = 1.0
+    if config.model.get("camera_model", "pinhole") == "fisheye":
+        # Only pixels inside the image circle count; it spans the full width (TartanAir).
+        h, w = pred.shape[-2:]
+        yy, xx = torch.meshgrid(torch.arange(h, device=pred.device), torch.arange(w, device=pred.device), indexing="ij")
+        mask = ((xx + 0.5 - w / 2) ** 2 + (yy + 0.5 - h / 2) ** 2 <= (w / 2) ** 2).to(pred.dtype)
+        pred, inside = pred * mask + target * (1 - mask), mask.mean().item()
+    mse = F.mse_loss(pred, target) / inside
+    l1 = F.l1_loss(pred, target) / inside
     perceptual = pred.new_tensor(0.0)
     if hasattr(loss_modules, "perceptual"):
         b, v, c, h, w = pred.shape
@@ -327,10 +334,13 @@ def init_wandb(config: edict, rank: int):
     )
 
 
-def camera_stats(result: edict) -> Dict[str, float]:
-    """Mean predicted focal length (normalized by image width) and the pinhole FOV it implies."""
+def camera_stats(result: edict, camera_model: str) -> Dict[str, float]:
+    """Mean predicted focal length (normalized by image width) and the FOV across the image width."""
     fx = result.fxfycxcy[:, 0].detach().float()
-    fov = 2.0 * torch.atan(0.5 / fx.clamp_min(1e-6))
+    if camera_model == "fisheye":
+        fov = 2.0 * 0.5 / fx.clamp_min(1e-6)
+    else:
+        fov = 2.0 * torch.atan(0.5 / fx.clamp_min(1e-6))
     return {
         "camera/fx_norm": fx.mean().item(),
         "camera/fov_deg": math.degrees(fov.mean().item()),
@@ -523,7 +533,7 @@ def main() -> None:
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/grad_norm": float(grad_norm),
                         "train/param_update_step": param_update_step,
-                        **camera_stats(result),
+                        **camera_stats(result, config.model.get("camera_model", "pinhole")),
                     }
                     wandb_run.log(log_data, step=step)
 
