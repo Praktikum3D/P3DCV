@@ -495,7 +495,8 @@ def main() -> None:
                     config.training.get("allowed_gradnorm_factor", 2.0)
                 )
                 no_pass_steps = int(config.training.get("no_pass_steps", 10))
-                skip_optimizer_step = bool(grad_norm > allowed_gradnorm and (step + 1) > no_pass_steps)
+                # A NaN norm compares False above the limit, so skip non-finite gradients explicitly.
+                skip_optimizer_step = bool(not torch.isfinite(grad_norm) or (grad_norm > allowed_gradnorm and (step + 1) > no_pass_steps))
                 if skip_optimizer_step and is_rank0(rank):
                     print(
                         f"WARNING: step {step + 1} grad norm too large "
