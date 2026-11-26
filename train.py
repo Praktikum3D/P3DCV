@@ -261,7 +261,7 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
         radius = torch.sqrt((xx + 0.5 - w / 2) ** 2 + (yy + 0.5 - h / 2) ** 2)
         limit = (result.fxfycxcy_target[..., 0].detach().float() * math.pi / 2).clamp(max=w / 2)
         mask = (radius <= limit[..., None, None, None]).to(pred.dtype)
-        pred, inside = pred * mask + target * (1 - mask), mask.mean().item()
+        pred, inside = pred * mask + target * (1 - mask), max(mask.mean().item(), 1e-3)
     mse = F.mse_loss(pred, target) / inside
     l1 = F.l1_loss(pred, target) / inside
     perceptual = pred.new_tensor(0.0)

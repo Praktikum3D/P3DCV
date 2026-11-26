@@ -934,7 +934,8 @@ class PoseEstimator(nn.Module):
         )
         self.canonical_k_head.apply(_init_weights)
 
-        self.f_bias = float(self.config.model.get("f_bias", 1.25))
+        self.f_bias = 1.25
+        self.f_scale = float(self.config.model.get("f_scale", 1.0))  # fisheye: maps the pinhole f to px per radian
 
     def forward(self, x, v):
         '''
@@ -995,7 +996,7 @@ class PoseEstimator(nn.Module):
             rt_final = rt_canonical + extrinsics_offset * mask
 
         # Predict fx/fy per view
-        fxfy_per_view = self.canonical_k_head(x) + self.f_bias  # [b, v, 1]
+        fxfy_per_view = (self.canonical_k_head(x) + self.f_bias) * self.f_scale  # [b, v, 1]
         fxfy_per_view = fxfy_per_view.repeat(1, 1, 2)           # [b, v, 2]
 
         # Average intrinsics across views
@@ -1029,7 +1030,7 @@ class PoseEstimator(nn.Module):
             raise NotImplementedError
 
         # Predict canonical intrinsics
-        fxfy_canonical = self.canonical_k_head(x_canonical[:, 0]) + self.f_bias  # [b, 1]
+        fxfy_canonical = (self.canonical_k_head(x_canonical[:, 0]) + self.f_bias) * self.f_scale  # [b, 1]
         fxfy_canonical = fxfy_canonical.unsqueeze(1).repeat(1, 1, 2)             # [b, 1, 2]
 
         # Identity canonical extrinsics
@@ -1069,7 +1070,7 @@ class PoseEstimator(nn.Module):
         x_canonical = x[:, 0:1]     # [b, 1, d]
 
         # Predict canonical intrinsics
-        fxfy_canonical = self.canonical_k_head(x_canonical[:, 0]) + self.f_bias  # [b, 1]
+        fxfy_canonical = (self.canonical_k_head(x_canonical[:, 0]) + self.f_bias) * self.f_scale  # [b, 1]
         fxfy_canonical = fxfy_canonical.unsqueeze(1).repeat(1, 1, 2)             # [b, 1, 2]
 
         # Identity canonical extrinsics

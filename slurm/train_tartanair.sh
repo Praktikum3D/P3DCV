@@ -39,10 +39,11 @@ WANDB_PROJECT="${WANDB_PROJECT-p3dcv}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-/mnt/home/$USER/.secrets/wandb.env}"
 VIS_EVERY="${VIS_EVERY:-500}"
 # Camera model for rays and rendering: pinhole or fisheye (equidistant).
-# The fisheye f_bias puts the initial focal length of erayzer_multi.pt near 195 degrees.
+# The fisheye F_SCALE turns the focal length of erayzer_multi.pt on TartanAir (about 1.1) into
+# px per radian near 195 degrees (0.29).
 CAMERA_MODEL="${CAMERA_MODEL:-pinhole}"
 # A small near plane keeps fisheye content close to 90 degrees from being dropped.
-if [[ "$CAMERA_MODEL" == fisheye ]]; then F_BIAS="${F_BIAS:-0.41}" NEAR="${NEAR:-0.01}"; else F_BIAS="${F_BIAS:-1.25}" NEAR="${NEAR:-0.2}"; fi
+if [[ "$CAMERA_MODEL" == fisheye ]]; then F_SCALE="${F_SCALE:-0.26}" NEAR="${NEAR:-0.01}"; else F_SCALE="${F_SCALE:-1.0}" NEAR="${NEAR:-0.2}"; fi
 
 mkdir -p "$RUN_DIR"
 
@@ -87,7 +88,7 @@ EXTRA_ARGS=(
     -s training.perceptual_loss_weight_path "$PRETRAINED_DIR/imagenet-vgg-verydeep-19.mat"
     -s training.vis_every "$VIS_EVERY"
     -s model.camera_model "$CAMERA_MODEL"
-    -s model.f_bias "$F_BIAS"
+    -s model.f_scale "$F_SCALE"
     -s model.near_plane "$NEAR"
     "$@"
 )
