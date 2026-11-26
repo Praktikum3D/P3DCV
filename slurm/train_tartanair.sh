@@ -47,7 +47,7 @@ if [[ "$CAMERA_MODEL" == fisheye ]]; then F_SCALE="${F_SCALE:-0.26}" NEAR="${NEA
 
 mkdir -p "$RUN_DIR"
 # The camera settings are not stored in the checkpoint, so a resumed run must use the same ones.
-SAVED_MODEL="$(sed -n 's/^ *camera_model: *//p' "$RUN_DIR/config.yaml" 2>/dev/null | head -n 1)"
+SAVED_MODEL="$(sed -n 's/^ *camera_model: *//p' "$RUN_DIR/config.yaml" 2>/dev/null | head -n 1 || true)"
 if [[ -f "$RUN_DIR/config.yaml" && "${SAVED_MODEL:-pinhole}" != "$CAMERA_MODEL" ]]; then
     echo "CAMERA_MODEL=$CAMERA_MODEL differs from $RUN_DIR/config.yaml, use the same one or a new RUN_NAME" >&2
     exit 1
