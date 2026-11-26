@@ -125,6 +125,8 @@ class Renderer(nn.Module):
 
         output: [b, v, 3, height, width]
         """
+        if self.config.model.get("detach_render_intrinsics", False):  # test: no focal length gradient from rendering
+            fxfycxcy = fxfycxcy.detach()
         if self.config.model.get("camera_model", "pinhole") != "pinhole":
             assert self.config.model.get("use_gsplat", True) and not self.config.model.get("use_deferred_rendering", False), \
                 "camera models other than pinhole need the gsplat renderer"
