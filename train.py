@@ -256,11 +256,12 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
     inside = 1.0
     camera_model = config.model.get("camera_model", "pinhole")
     if camera_model != "pinhole":
-        # Only pixels the camera can render count, for fisheye data only inside the image circle.
+        # Only pixels the camera can render count, for fisheye data only inside the image circle. 3DGEER too
+        # only guarantees coverage below 90 degrees, beyond that it culls the Gaussian centres and merely splat
+        # tails reach, so those pixels stay background without a gradient and must not contribute to the loss.
         b, v, _, h, w = pred.shape
         fxfycxcy = result.fxfycxcy_target.detach().float().reshape(b * v, -1)
-        mask = render_mask(fxfycxcy, h, w, camera_model, "fish" in str(config.dataset.get("camera_name", "")),
-                           exact=config.model.get("renderer", "gsplat") == "geer")
+        mask = render_mask(fxfycxcy, h, w, camera_model, "fish" in str(config.dataset.get("camera_name", "")))
         mask = mask.reshape(b, v, 1, h, w).to(pred.dtype)
         pred, inside = pred * mask + target * (1 - mask), max(mask.mean().item(), 1e-3)
     mse = F.mse_loss(pred, target) / inside

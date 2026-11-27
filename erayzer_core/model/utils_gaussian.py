@@ -51,8 +51,9 @@ def pixel_angles(fxfycxcy, h, w, camera_model, exact=False):
     """Offsets dx, dy from the principal point, their radius, the angle to the optical axis and the pixels
     the camera can render, all [n, h, w]. fxfycxcy [n, 4] in pixels, for UCM [n, 5] with alpha last.
 
-    gsplat drops everything behind the camera plane (more than 90 degrees off axis), the exact 3DGEER
-    renderer does not. UCM is undefined outside its own image circle.
+    Both renderers drop everything behind the camera plane (more than 90 degrees off axis), 3DGEER culls the
+    Gaussian centres there and only splat tails reach further. UCM is undefined outside its own image circle.
+    With exact the angle is not capped at all, which the Kannala Brandt fit needs to know its own range.
     """
     y, x = torch.meshgrid(torch.arange(h, device=fxfycxcy.device), torch.arange(w, device=fxfycxcy.device), indexing="ij")
     dx, dy = x + 0.5 - fxfycxcy[:, 2, None, None], y + 0.5 - fxfycxcy[:, 3, None, None]
