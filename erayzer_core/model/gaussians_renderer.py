@@ -728,8 +728,20 @@ def render_opencv_cam_gsplat(
     sh_degree: Union[int, None] = None,
     near_plane=0.2,
     bg_color=(1.0, 1.0, 1.0),
-    render_depth=False
+    render_depth=False,
+    camera_model="pinhole",
+    radial_coeffs=None,
 ):
+    """Render with gsplat.
+
+    camera_model: "pinhole" (default) or any camera model of our gsplat fork,
+        e.g. "kb" for Kannala-Brandt / OpenCV fisheye. With "kb" the rendered
+        depth is the distance to the camera centre instead of z.
+    radial_coeffs: [v, 4] Kannala-Brandt coefficients (k1, k2, k3, k4), only
+        used with camera_model="kb" (None means zeros, i.e. equidistant).
+        Gradients flow to them like to fxfycxcy.
+    With the defaults the call to gsplat is the same as before these options.
+    """
     means3D = pc.get_xyz # [N, 3]
     opacity = pc.get_opacity
     scales = pc.get_scaling
@@ -749,12 +761,20 @@ def render_opencv_cam_gsplat(
     intr[:, 2, 2] = 1.0
 
     render_mode = "RGB+ED" if render_depth else 'RGB'
+    # Only pass the camera options when they differ from the defaults, so the
+    # default call is unchanged (and works with an unmodified gsplat).
+    camera_kwargs = {}
+    if camera_model != "pinhole":
+        camera_kwargs["camera_model"] = camera_model
+    if radial_coeffs is not None:
+        camera_kwargs["radial_coeffs"] = radial_coeffs.to(intr).contiguous()
     render_colors, _, _ = rasterization(means3D, rotations, scales, opacity.squeeze(), 
                                         shs, W2C, intr, width, height, 
                                         near_plane=near_plane,
                                         sh_degree=sh_degree, 
                                         backgrounds=bg_color,
-                                        render_mode=render_mode) # v x h x w x 3
+                                        render_mode=render_mode,
+                                        **camera_kwargs) # v x h x w x 3
     if render_mode != 'RGB':
         render_colors, render_depth = render_colors[...,:3], render_colors[...,3:]
     else:

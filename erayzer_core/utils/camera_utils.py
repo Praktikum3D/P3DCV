@@ -949,3 +949,166 @@ def fisheye624_unproject(coords: torch.Tensor, distortion_params: torch.Tensor) 
     dirs[..., 1] = -dirs[..., 1]
     dirs[..., 2] = -dirs[..., 2]
     return dirs
+
+# ---------------------------------------------------------------------------
+# Kannala-Brandt (OpenCV fisheye) camera, k1..k4.
+#
+#   theta = angle between the ray and the optical axis
+#   psi(theta) = theta (1 + k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8)
+#   (u, v) = (fx psi x / r + cx, fy psi y / r + cy)
+#
+# This is the same model, with the same constants, as camera_model="kb" in our
+# gsplat fork (third_party/gsplat, _torch_impl._kb_proj and csrc/utils.cuh).
+# k1..k4 = 0 is the equidistant model r = f theta (TartanAir lcam_fish).
+# ---------------------------------------------------------------------------
+
+# Same default as gsplat.cuda._wrapper.KB_DEFAULT_MAX_THETA in our fork.
+KB_DEFAULT_MAX_THETA = 0.75 * math.pi
+# Number of samples and bisection steps for kb_theta_max(), same as gsplat.
+_KB_LIMIT_SAMPLES = 64
+_KB_LIMIT_BISECT = 30
+# Below this distorted radius (theta_d, in normalised units) the direction is
+# taken from its Taylor expansion instead of sin(theta) / theta_d.
+_KB_SMALL_THETA_D = 1e-4
+_KB_NEWTON_ITERS = 10
+
+
+def kb_psi(theta: Tensor, radial_coeffs: Tensor) -> Tensor:
+    """psi(theta) = theta (1 + k1 t + k2 t^2 + k3 t^3 + k4 t^4) with t = theta^2.
+
+    theta: [...], radial_coeffs: [..., 4] (broadcastable against theta[..., None]).
+    """
+    t = theta * theta
+    k1, k2, k3, k4 = torch.unbind(radial_coeffs, dim=-1)
+    return theta * (1 + t * (k1 + t * (k2 + t * (k3 + t * k4))))
+
+
+def kb_dpsi(theta: Tensor, radial_coeffs: Tensor) -> Tensor:
+    """psi'(theta) = 1 + 3 k1 t + 5 k2 t^2 + 7 k3 t^3 + 9 k4 t^4 with t = theta^2."""
+    t = theta * theta
+    k1, k2, k3, k4 = torch.unbind(radial_coeffs, dim=-1)
+    return 1 + t * (3 * k1 + t * (5 * k2 + t * (7 * k3 + t * 9 * k4)))
+
+
+@torch.no_grad()
+def kb_theta_max(radial_coeffs: Tensor, max_theta: float = KB_DEFAULT_MAX_THETA) -> Tensor:
+    """Largest valid incidence angle of a Kannala-Brandt camera.
+
+    psi(theta) has to increase strictly, otherwise the projection folds over and
+    is no longer invertible. The limit is the first positive root of psi'
+    (sampled on [0, max_theta] and bisected), or max_theta if psi' stays
+    positive. Same algorithm as kb_theta_limit() in our gsplat fork.
+
+    radial_coeffs: [..., 4]. Returns [...] (no gradient).
+    """
+    k = radial_coeffs.detach()
+    batch = k.shape[:-1]
+    step = max_theta / _KB_LIMIT_SAMPLES
+    th = (torch.arange(1, _KB_LIMIT_SAMPLES + 1, device=k.device, dtype=k.dtype) * step).expand(
+        *batch, _KB_LIMIT_SAMPLES
+    )
+    neg = kb_dpsi(th, k[..., None, :]) <= 0
+    has_root = neg.any(dim=-1)
+    first = torch.where(
+        has_root,
+        neg.int().argmax(dim=-1),
+        torch.full_like(neg[..., 0], _KB_LIMIT_SAMPLES - 1, dtype=torch.long),
+    )
+    hi = torch.gather(th, -1, first[..., None])[..., 0]
+    lo = hi - step
+    for _ in range(_KB_LIMIT_BISECT):
+        mid = 0.5 * (lo + hi)
+        pos = kb_dpsi(mid, k) > 0
+        lo = torch.where(pos, mid, lo)
+        hi = torch.where(pos, hi, mid)
+    return torch.where(has_root, lo, torch.full_like(lo, max_theta))
+
+
+def kb_unproject(
+    points: Tensor,
+    radial_coeffs: Tensor,
+    max_theta: float = KB_DEFAULT_MAX_THETA,
+) -> Tuple[Tensor, Tensor]:
+    """Unproject normalised image points of a Kannala-Brandt camera to unit rays.
+
+    Args:
+        points: [..., 2] normalised image coordinates
+            (mx, my) = ((u - cx) / fx, (v - cy) / fy), with u, v in pixels
+            (OpenCV convention: pixel (i, j) has its centre at (j + 0.5, i + 0.5)
+            in the convention used by cam_info_to_plucker and gsplat).
+        radial_coeffs: [..., 4] coefficients (k1, k2, k3, k4), broadcastable
+            against points[..., 0].
+        max_theta: Largest incidence angle in radians (see kb_theta_max()).
+
+    Returns:
+        dirs: [..., 3] unit ray directions in camera coordinates (x right,
+            y down, z forward); z < 0 for angles beyond 90 degrees.
+        valid: [...] bool. False where theta_d >= psi(theta_max), i.e. outside
+            the image region the model can represent. Those rays are set to the
+            optical axis (0, 0, 1), a constant: finite and without gradient.
+
+    Gradients flow to points (and thus fx, fy, cx, cy) and radial_coeffs. The
+    angle is found with a safeguarded Newton solve under no_grad; the gradient
+    is then attached with one differentiable Newton step whose derivative
+    psi'(theta*) is detached:
+        theta = theta* - (psi(theta*; k) - theta_d) / psi'(theta*)
+    Its derivative is exactly the implicit-function-theorem gradient
+        d theta = (d theta_d - sum_i theta^(2i+1) d k_i) / psi'(theta).
+    """
+    mx, my = points[..., 0], points[..., 1]
+    k = torch.broadcast_to(radial_coeffs, (*mx.shape, 4))
+    k1 = k[..., 0]
+    td2 = mx * mx + my * my  # theta_d^2
+
+    with torch.no_grad():
+        theta_lim = kb_theta_max(k, max_theta)  # [...]
+        psi_lim = kb_psi(theta_lim, k)
+        td_v = torch.sqrt(td2.detach())
+        valid = td_v < psi_lim
+
+        # Safeguarded Newton on psi(theta) = theta_d over [0, theta_lim]. Invalid
+        # pixels solve a harmless stand-in problem so that nothing is NaN.
+        td_safe = torch.where(valid, td_v, 0.5 * psi_lim)
+        lo = torch.zeros_like(td_safe)
+        hi = theta_lim.clone()
+        th = torch.minimum(td_safe, 0.5 * (lo + hi))
+        for _ in range(_KB_NEWTON_ITERS):
+            f = kb_psi(th, k) - td_safe
+            lo = torch.where(f < 0, th, lo)
+            hi = torch.where(f < 0, hi, th)
+            step = f / kb_dpsi(th, k).clamp(min=1e-12)
+            th_new = th - step
+            # Fall back to bisection when Newton leaves the bracket. Landing on
+            # a bracket end is fine (it happens once the residual is exactly 0).
+            outside = (th_new < lo) | (th_new > hi)
+            th = torch.where(outside, 0.5 * (lo + hi), th_new)
+        theta_star = th
+        dpsi_star = kb_dpsi(theta_star, k)
+
+    small = td2.detach() < _KB_SMALL_THETA_D**2
+
+    # Differentiable Newton step (IFT gradient). td is taken from a safe value
+    # where it is tiny (the series branch below is used there) or invalid.
+    use_gen = valid & ~small
+    td2_gen = torch.where(use_gen, td2, torch.ones_like(td2))
+    td_gen = torch.sqrt(td2_gen)
+    theta_target = torch.where(use_gen, td_gen, td_safe)
+    theta = theta_star - (kb_psi(theta_star, k) - theta_target) / dpsi_star
+    sin_over_td_gen = torch.sin(theta) / td_gen
+    cos_gen = torch.cos(theta)
+
+    # Taylor expansion at the principal point: theta = td - k1 td^3 + O(td^5),
+    # sin(theta) / td = 1 - (k1 + 1/6) td^2, cos(theta) = 1 - td^2 / 2.
+    sin_over_td_ser = 1 - (k1 + 1.0 / 6.0) * td2
+    cos_ser = 1 - 0.5 * td2
+
+    sin_over_td = torch.where(small, sin_over_td_ser, sin_over_td_gen)
+    cos_theta = torch.where(small, cos_ser, cos_gen)
+    dirs = torch.stack([sin_over_td * mx, sin_over_td * my, cos_theta], dim=-1)
+
+    # Constant placeholder (optical axis) for invalid pixels: finite, and its
+    # derivative with respect to the intrinsics and k is exactly zero.
+    placeholder = torch.zeros_like(dirs.detach())
+    placeholder[..., 2] = 1
+    dirs = torch.where(valid[..., None], dirs, placeholder)
+    return dirs, valid

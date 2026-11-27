@@ -17,6 +17,9 @@ RUN pip install -r /tmp/requirements.txt
 
 # gsplat fork used by E-RayZer (adds gradients w.r.t. intrinsics), pinned to
 # the commit of branch v1.4.0-working. The CUDA extension is compiled here.
+# A copy of this commit with the Kannala-Brandt camera (camera_model="kb") is
+# vendored in third_party/gsplat and is built and tested by
+# slurm/test_gsplat_kb.sh; switching the image to it is a later step.
 # No GPU is visible during the build, so the target architectures are listed
 # explicitly: RTX 20xx / TITAN RTX / RTX 5000 (7.5), RTX 3090 / A5000 (8.6),
 # RTX 4090 (8.9), H200 (9.0). gsplat does not compile for anything older

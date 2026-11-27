@@ -805,14 +805,34 @@ def get_cam_se3(cam_info):
     return c2w, fxfycxcy
 
 
-def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return_moment=True):
+def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return_moment=True,
+                        radial_coeffs=None, return_valid_mask=False,
+                        kb_max_theta=camera_utils.KB_DEFAULT_MAX_THETA):
     '''
     c2w: [b,4,4] or [b,v,4,4]
     fxfycxcy: [b,4] or [b,v,4]
+    radial_coeffs: None (pinhole, the default) or Kannala-Brandt / OpenCV fisheye
+        coefficients (k1, k2, k3, k4), [b,4] or [b,v,4] with the same batching as
+        fxfycxcy. They are dimensionless and never normalised by the resolution.
+        With coefficients, ray directions come from KB unprojection
+        (camera_utils.kb_unproject) with the same pixel-space fx, fy, cx, cy and
+        pixel centres (x + 0.5) as the renderer with camera_model="kb", and
+        gradients flow to fxfycxcy and radial_coeffs. k1..k4 = 0 is the
+        equidistant fisheye (TartanAir lcam_fish). A caller that predicts the
+        coefficients passes them here and the same values to
+        render_opencv_cam_gsplat(..., camera_model="kb", radial_coeffs=...).
+    return_valid_mask: if True, also return a [b,1,h,w] bool mask that is False for
+        pixels outside the region the KB model can represent (their rays are a
+        finite placeholder without gradient). All True without radial_coeffs.
+    kb_max_theta: largest incidence angle (radians) of the KB model.
     '''
-    if len(c2w.shape) == 3: 
+    if len(c2w.shape) == 3:
         b = c2w.shape[0]
     elif len(c2w.shape) == 4:
+        if radial_coeffs is not None:
+            if radial_coeffs.dim() == 2:
+                radial_coeffs = radial_coeffs[:, None, :].expand(c2w.shape[0], c2w.shape[1], 4)
+            radial_coeffs = rearrange(radial_coeffs, "b v d -> (b v) d")
         c2w, fxfycxcy = rearrange(c2w.clone(), "b v n d -> (b v) n d"), \
             rearrange(fxfycxcy.clone(), "b v d -> (b v) d")
         b = c2w.shape[0]
@@ -833,8 +853,17 @@ def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return
     y = y[None, :, :].expand(b, -1, -1).reshape(b, -1)
     x = (x + 0.5 - fxfycxcy[:, 2:3]) / fxfycxcy[:, 0:1]
     y = (y + 0.5 - fxfycxcy[:, 3:4]) / fxfycxcy[:, 1:2]
-    z = torch.ones_like(x)
-    ray_d = torch.stack([x, y, z], dim=2)  # [b, h*w, 3]
+    if radial_coeffs is None:
+        z = torch.ones_like(x)
+        ray_d = torch.stack([x, y, z], dim=2)  # [b, h*w, 3]
+        valid = None
+    else:
+        # Kannala-Brandt unprojection, unit directions in camera space
+        ray_d, valid = camera_utils.kb_unproject(
+            torch.stack([x, y], dim=2),  # [b, h*w, 2]
+            radial_coeffs.to(x)[:, None, :],  # [b, 1, 4]
+            max_theta=kb_max_theta,
+        )  # [b, h*w, 3], [b, h*w]
     ray_d = torch.bmm(ray_d, c2w[:, :3, :3].transpose(1, 2))  # [b, h*w, 3]
     ray_d = ray_d / torch.norm(ray_d, dim=2, keepdim=True)  # [b, h*w, 3]
     ray_o = c2w[:, :3, 3][:, None, :].expand_as(ray_d)  # [b, h*w, 3]
@@ -858,6 +887,10 @@ def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return
             ],
             dim=1,
         )
+    if return_valid_mask:
+        if valid is None:
+            valid = torch.ones(b, h, w, dtype=torch.bool, device=device)
+        return plucker, valid.reshape(b, 1, h, w)  # [b,c=6,h,w], [b,1,h,w]
     return plucker     # [b,c=6,h,w]
 
 
