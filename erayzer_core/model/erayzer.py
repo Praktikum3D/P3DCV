@@ -102,6 +102,21 @@ def mask_corner_opacity(opacity, corner_mask, v_input, logit=CORNER_OPACITY_LOGI
     return opacity.masked_fill(tiled, logit)
 
 
+def mask_corner_opacity_from_data(opacity, data_mask, ph, pw, logit=CORNER_OPACITY_LOGIT):
+    """Hide the Gaussians born on pixels that carry no image data, opacity [b, v_input*n, 1].
+
+    `data_mask` is [b, v_input, 1, h, w] of the INPUT views, 1 where the image is real. It replaces
+    the fixed circle of `corner_gaussian_mask` once the camera augmentation gives every sample its
+    own camera, whose valid region depends on the drawn model, field of view and alpha.
+
+    The Gaussian order is the 'b (v hh ww ph pw) c' of ERayZer.forward, the same order
+    corner_gaussian_mask produces for a single view, so the rearrange below must match it exactly.
+    """
+    outside = data_mask[:, :, 0] <= 0.5
+    outside = rearrange(outside, "b v (hh ph) (ww pw) -> b (v hh ww ph pw)", ph=ph, pw=pw)
+    return opacity.masked_fill(outside[..., None], logit)
+
+
 def corner_masking_default(config):
     """Whether to hide the corner Gaussians unless model.mask_input_corners says otherwise.
 
@@ -420,6 +435,12 @@ class ERayZer(nn.Module):
         device = image_all.device
         batch_idx = torch.arange(b, device=device).unsqueeze(1)
         image_data_all = data["image"]
+        # Which pixels of each view carry real image data, [b, v_all, 1, h, w] or None. The camera
+        # augmentation resamples every sample to its own camera, so the valid region is no longer
+        # the fixed image circle of lcam_fish but differs from sample to sample.
+        data_mask_all = data.get("data_mask")
+        if data_mask_all is not None:
+            data_mask_all = data_mask_all.to(device=device, dtype=image_data_all.dtype)
 
         # Padding input to 10 views if less than 10 views (repeat the last view)
         if v < 10:
@@ -430,6 +451,9 @@ class ERayZer(nn.Module):
             image_all = torch.cat([image_all, last_view], dim=1)                   # [b, v_all, c, h, w]
             last_image = image_data_all[:, -1:, ...].repeat(1, pad_views, 1, 1, 1)
             image_data_all = torch.cat([image_data_all, last_image], dim=1)
+            if data_mask_all is not None:  # the padded views repeat the last one, mask included
+                last_mask = data_mask_all[:, -1:, ...].repeat(1, pad_views, 1, 1, 1)
+                data_mask_all = torch.cat([data_mask_all, last_mask], dim=1)
         else:
             pad_input = False
             v_all = v
@@ -493,6 +517,10 @@ class ERayZer(nn.Module):
         fxfycxcy_target = pred_fxfycxcy[batch_idx, target_idx].clone()          # [b, v_target, 4]
         target_image = image_data_all[batch_idx, target_idx]
         v_input = input_idx.shape[1]
+        data_mask_input = data_mask_target = None
+        if data_mask_all is not None:
+            data_mask_input = data_mask_all[batch_idx, input_idx]                # [b, v_input, 1, h, w]
+            data_mask_target = data_mask_all[batch_idx, target_idx]              # [b, v_target, 1, h, w]
     
         plucker_rays_input = cam_info_to_plucker(c2w_input, fxfycxcy_input, self.config.model.target_image, normalized=normalized, return_moment=True, camera_model=self.config.model.get("camera_model", "pinhole"))
         plucker_rays_input = rearrange(plucker_rays_input, '(b v) c h w -> b v h w c', b=b, v=v_input)
@@ -530,7 +558,10 @@ class ERayZer(nn.Module):
         if self.mask_input_corners:
             # right here, so every later user of opacity sees the same tensor: the renderer, the video
             # renderer and the usage and opacity statistics further down
-            opacity = mask_corner_opacity(opacity, self.corner_mask, v_input)
+            if data_mask_input is not None:
+                opacity = mask_corner_opacity_from_data(opacity, data_mask_input, self.ph, self.pw)
+            else:
+                opacity = mask_corner_opacity(opacity, self.corner_mask, v_input)
         img_aligned_xyz = rearrange(
             xyz,
             "b (v hh ww ph pw) c -> b v c (hh ph) (ww pw)",
@@ -659,6 +690,11 @@ class ERayZer(nn.Module):
             input_idx=input_idx,
             target_idx=target_idx,
         )
+
+        if data_mask_target is not None:
+            # The target views are a random subset of all views, so the loss cannot use the batch
+            # field directly; it needs the same subset the rendered images belong to.
+            result.target_data_mask = data_mask_target
 
         if vis_only_results is not None:
             result.render_video = vis_only_results.rendered_images_video.detach().clamp(0, 1)

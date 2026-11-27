@@ -5,6 +5,7 @@ from typing import Any
 from easydict import EasyDict as edict
 from torch.utils.data import Dataset
 
+from training.camera_augmentation import DEFAULT_SUPERSAMPLE
 from training.dl3dv_dataset import DL3DVDataset
 from training.tartanair_dataset import TartanAirDataset
 
@@ -89,6 +90,9 @@ def build_dataset(config: edict, *, split: str) -> Dataset[Any]:
             max_resample_tries=int(training.get("max_resample_tries", 100)),
             data_repeat=int(config.get("data_repeat", 1)),
             is_eval=split == "eval",
+            camera_augmentation=bool(dataset.get("camera_augmentation", False)),
+            camera_aug_mix=dataset.get("camera_aug_mix"),
+            camera_aug_supersample=int(dataset.get("camera_aug_supersample", DEFAULT_SUPERSAMPLE)),
         )
 
     raise ValueError(f"Unsupported config.dataset.name: {dataset_name!r}")

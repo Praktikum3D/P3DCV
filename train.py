@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 import erayzer_core  # noqa: F401  # registers model.* and utils.* aliases
 from erayzer_core.losses import PerceptualLoss
 from erayzer_core.model.utils_gaussian import camera_theta, loss_render_mask
+from training.camera_augmentation import MODEL_CODES
 from training.datasets import build_dataset as build_config_dataset
 
 
@@ -312,15 +313,28 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
 
     inside = 1.0
     camera_model = config.model.get("camera_model", "pinhole")
+    b, v, _, h, w = pred.shape
+    mask = None
     if camera_model != "pinhole":
         # Only pixels the camera can render count, for fisheye data only inside the image circle, and only as
         # far out as the renderer in use reaches. Everything the renderer leaves at the background colour has
         # no gradient and must not contribute to the loss, which is why loss_render_mask stops at 90 degrees
         # unless 3DGEER assigns its tiles by projection. The evaluation scores the very same pixels.
-        b, v, _, h, w = pred.shape
         fxfycxcy = result.fxfycxcy_target.detach().float().reshape(b * v, -1)
         mask = loss_render_mask(config, fxfycxcy, h, w)
         mask = mask.reshape(b, v, 1, h, w).to(pred.dtype)
+
+    # With camera augmentation a view also has pixels its own camera never saw, the black outside of
+    # the resampled image. Those carry no target either, so the loss counts the intersection of what
+    # the predicted camera can render and what the data actually holds. Both masks are constants.
+    data_mask = result.get("target_data_mask")
+    if data_mask is None and "data_mask" in batch and batch["data_mask"].shape[1] == v:
+        data_mask = batch["data_mask"]
+    if data_mask is not None:
+        data_mask = data_mask.detach().to(device=pred.device, dtype=pred.dtype)
+        mask = data_mask if mask is None else mask * data_mask
+
+    if mask is not None:
         pred, inside = pred * mask + target * (1 - mask), max(mask.mean().item(), 1e-3)
     mse = F.mse_loss(pred, target) / inside
     l1 = F.l1_loss(pred, target) / inside
@@ -406,6 +420,56 @@ def camera_stats(result: edict, camera_model: str) -> Dict[str, float]:
     stats = {"camera/fx_norm": fx.mean().item(), "camera/fov_deg": math.degrees(fov.mean().item())}
     if alpha is not None:
         stats["camera/alpha"] = alpha.mean().item()
+    return stats
+
+
+def aug_stats(
+    result: edict, batch: Dict[str, torch.Tensor], camera_model: str
+) -> Dict[str, float]:
+    """How far the predicted camera is from the one the augmentation actually drew.
+
+    Empty unless the batch carries `aug_fov_true`, so a run without camera augmentation logs exactly
+    what it logged before. The true values are never fed to the model, they only score it here.
+    The errors are reported overall and per drawn model, because a pinhole and a 195 degree fisheye
+    are very different jobs and a single mean would hide which one fails.
+    """
+    if "aug_fov_true" not in batch:
+        return {}
+
+    # Everything is compared on the CPU: the batch fields arrive on the training device, the stats
+    # end up as Python floats anyway, and a few scalars per batch cost nothing.
+    fov_true = batch["aug_fov_true"].detach().float().flatten().cpu()           # [b]
+    b = fov_true.shape[0]
+    # [b*v_all, 4 or 5] back to [b, v_all, .]. The views padded up to ten repeat the last image, so
+    # their predictions belong to the same drawn camera and averaging over all of them is right.
+    fxfycxcy = result.fxfycxcy.detach().float().reshape(b, -1, result.fxfycxcy.shape[-1])
+    fx = fxfycxcy[..., 0].mean(dim=1)                                           # [b], mean over views
+    has_alpha = camera_model == "ucm" and fxfycxcy.shape[-1] > 4
+    alpha = fxfycxcy[..., 4].mean(dim=1) if has_alpha else None
+    model_for_fov = camera_model if has_alpha or camera_model != "ucm" else "pinhole"
+    fov_pred = torch.rad2deg(2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), model_for_fov, alpha))
+    fov_err = (fov_pred.cpu() - fov_true).abs()
+
+    stats = {"aug/fov_err_deg": fov_err.mean().item()}
+    alpha_err = None
+    if alpha is not None and "aug_alpha_true" in batch:
+        alpha_true = batch["aug_alpha_true"].detach().float().flatten().cpu()
+        alpha_err = (alpha.cpu() - alpha_true).abs()
+        finite = torch.isfinite(alpha_err)
+        if bool(finite.any()):
+            stats["aug/alpha_err"] = alpha_err[finite].mean().item()
+
+    if "aug_model" in batch:
+        codes = batch["aug_model"].detach().flatten().cpu()
+        for name, code in MODEL_CODES.items():
+            picked = codes == code
+            if not bool(picked.any()):
+                continue
+            stats[f"aug/fov_err_deg_{name}"] = fov_err[picked].mean().item()
+            if alpha_err is not None:
+                chosen = picked & torch.isfinite(alpha_err)
+                if bool(chosen.any()):
+                    stats[f"aug/alpha_err_{name}"] = alpha_err[chosen].mean().item()
     return stats
 
 
@@ -618,6 +682,7 @@ def main() -> None:
                         "train/param_update_step": param_update_step,
                         "train/mask_fraction": metrics.mask_fraction.item(),
                         **camera_stats(result, config.model.get("camera_model", "pinhole")),
+                        **aug_stats(result, batch, config.model.get("camera_model", "pinhole")),
                     }
                     wandb_run.log(log_data, step=step)
 
