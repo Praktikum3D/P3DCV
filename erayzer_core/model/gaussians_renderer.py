@@ -774,11 +774,12 @@ def render_opencv_cam_geer(pc, height, width, C2W, fxfycxcy, sh_degree, near_pla
 
     The ray of every pixel is built here in PyTorch from C2W and fxfycxcy and handed to the rasterizer,
     which gives gradients back for it. The camera model therefore lives entirely in PyTorch and autograd
-    reaches pose, focal length and the UCM alpha through the rays, so the Gaussians stay in world space
+    reaches pose, focal length and the (E)UCM alpha through the rays, so the Gaussians stay in world space
     and the view matrix goes in detached. camera_model and radial_coeffs ("fisheye" is Kannala Brandt
     with radial_coeffs [v, 4], zeros give the equidistant model) only describe the projection 3DGEER
-    uses to assign tiles and to cull, which is why UCM renders as a Kannala Brandt fisheye fitted to it;
-    ray_camera_model ("pinhole", "fisheye" or "ucm", defaults to camera_model) builds the real rays.
+    uses to assign tiles and to cull, which is why the (E)UCM renders as a Kannala Brandt fisheye fitted
+    to it; ray_camera_model ("pinhole", "fisheye", "ucm" or "eucm", defaults to camera_model) builds the
+    real rays and reads alpha from column 4 of fxfycxcy and beta from column 5.
     geer_tile_mode picks how 3DGEER assigns the Gaussians to tiles: "pbf" is its own bounding function in
     tangent space, which culls everything behind the camera plane and so renders nothing beyond 90 degrees
     off axis, while "projection" projects the centres with the camera model above and therefore fills a

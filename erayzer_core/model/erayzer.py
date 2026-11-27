@@ -15,7 +15,7 @@ from .utils_transformer import (
 from utils import camera_utils
 from .utils_pe import get_2d_sincos_pos_embed
 from .utils_rot import rot6d2mat, quat2mat
-from .utils_gaussian import get_point_range_func, Renderer, camera_rays
+from .utils_gaussian import UCM_MODELS, get_point_range_func, Renderer, camera_rays
 from .utils_vis import build_stepback_c2ws
 
 
@@ -290,13 +290,26 @@ class ERayZer(nn.Module):
 
         # pose predictor
         self.pose_predictor = PoseEstimator(self.config)
-        if self.config.model.get("camera_model", "pinhole") == "ucm":
-            # UCM alpha per scene, starts at alpha_init and stays in (0, 1).
+        camera_model = self.config.model.get("camera_model", "pinhole")
+        if camera_model in UCM_MODELS:
+            # (E)UCM alpha per scene, starts at alpha_init and stays in (0, 1).
             self.alpha_head = nn.Linear(self.config.model.transformer.d, 1)
             nn.init.zeros_(self.alpha_head.weight)
             a0 = float(self.config.model.get("alpha_init", 0.5))
             nn.init.constant_(self.alpha_head.bias, math.log(a0 / (1 - a0)))
-        
+        self.learn_beta = bool(self.config.model.get("learn_beta", False))
+        if camera_model == "eucm":
+            # EUCM beta per scene, the second shape parameter of the camera. beta = 1 is exactly the
+            # UCM, and that is where this head is pinned: unless model.learn_beta is on, forward
+            # replaces its output by a constant 1.0, so no gradient reaches it and the rendering is
+            # the UCM one bit for bit. The head still exists, lands in the checkpoint and in the
+            # camera parameter group of the optimizer, so turning beta on later changes one switch
+            # and nothing else. exp() of the head keeps a learned beta positive, and the zero
+            # initialisation makes exp(0) = 1 the starting point of the learnable mode as well.
+            self.beta_head = nn.Linear(self.config.model.transformer.d, 1)
+            nn.init.zeros_(self.beta_head.weight)
+            nn.init.zeros_(self.beta_head.bias)
+
         # input pose tokenizer
         self.input_pose_tokenizer = nn.Sequential(
             Rearrange(
@@ -491,9 +504,16 @@ class ERayZer(nn.Module):
         pred_c2w, pred_fxfycxcy = get_cam_se3(cam_info) # [b*v_all, 4, 4], [b*v_all, 4]
         pred_c2w = rearrange(pred_c2w, '(b v) n d -> b v n d', b=b)
         pred_fxfycxcy = rearrange(pred_fxfycxcy, '(b v) d -> b v d', b=b)
-        if hasattr(self, "alpha_head"):  # UCM alpha as a fifth intrinsic, shared by the views of a scene
-            alpha = torch.sigmoid(self.alpha_head(rearrange(cam_tokens, '(b v) d -> b v d', b=b).mean(1)).float())  # bf16 would saturate at 1
+        if hasattr(self, "alpha_head"):  # (E)UCM alpha as a fifth intrinsic, shared by the views of a scene
+            scene_token = rearrange(cam_tokens, '(b v) d -> b v d', b=b).mean(1)                  # [b, d]
+            alpha = torch.sigmoid(self.alpha_head(scene_token).float())  # bf16 would saturate at 1
             pred_fxfycxcy = torch.cat([pred_fxfycxcy, alpha[:, None].expand(-1, v_all, -1).to(pred_fxfycxcy)], dim=-1)
+            if hasattr(self, "beta_head"):  # EUCM beta as a sixth intrinsic, see __init__
+                beta = torch.exp(self.beta_head(scene_token).float())
+                if not self.learn_beta:
+                    # Exactly 1.0 and detached from the head, which makes the camera the plain UCM.
+                    beta = torch.ones_like(beta)
+                pred_fxfycxcy = torch.cat([pred_fxfycxcy, beta[:, None].expand(-1, v_all, -1).to(pred_fxfycxcy)], dim=-1)
         if iter < self.freeze_focal_steps:
             pred_fxfycxcy = pred_fxfycxcy.detach()
         normalized = True
@@ -927,7 +947,7 @@ def get_cam_se3(cam_info):
 def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return_moment=True, camera_model="pinhole"):
     '''
     c2w: [b,4,4] or [b,v,4,4]
-    fxfycxcy: [b,4] or [b,v,4]
+    fxfycxcy: [b,4] or [b,v,4], UCM [...,5] with alpha last, EUCM [...,6] with beta after it
     '''
     if len(c2w.shape) == 3: 
         b = c2w.shape[0]
