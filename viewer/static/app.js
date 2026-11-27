@@ -116,7 +116,8 @@ function currentRequest() {
     fov_deg: Number(element("fov").value),
     alpha: Number(element("alpha").value),
     res: Number(element("res").value),
-    aspect: Math.max(stage.width / Math.max(stage.height, 1), 0.2),
+    // The same bounds the server enforces, so an odd window shape never produces a rejected frame.
+    aspect: Math.min(Math.max(stage.width / Math.max(stage.height, 1), 0.2), 10),
     moving: state.moving,
     tile_mode: element("tile-mode").value,
     frusta: element("frusta").checked,
@@ -300,17 +301,24 @@ function fillViewButtons() {
   });
 }
 
+function fillSelect(id, entries, valueOf, labelOf) {
+  const select = element(id);
+  const previous = select.value;
+  select.innerHTML = "";
+  entries.forEach((entry) => {
+    const option = document.createElement("option");
+    option.value = valueOf(entry);
+    option.textContent = labelOf(entry);
+    select.appendChild(option);
+  });
+  if (previous) select.value = previous;
+}
+
 function applyState(data) {
-  if (data.scenes) {
-    const select = element("scene-select");
-    select.innerHTML = "";
-    data.scenes.forEach((entry) => {
-      const option = document.createElement("option");
-      option.value = entry.id;
-      option.textContent = entry.label;
-      select.appendChild(option);
-    });
-  }
+  if (data.scenes) fillSelect("scene-select", data.scenes, (e) => e.id, (e) => e.label);
+  if (data.checkpoints) fillSelect("ckpt-select", data.checkpoints, (e) => e.id, (e) => e.label);
+  if (data.envs) fillSelect("env-select", data.envs, (e) => e.name, (e) => e.label);
+  if (data.model) showModel(data.model);
   if (data.resolutions && element("res").options.length === 0) {
     data.resolutions.forEach((value) => {
       const option = document.createElement("option");
@@ -356,6 +364,73 @@ async function loadScene() {
   adoptScene(data.scene);
 }
 
+function showModel(model) {
+  element("ckpt-status").textContent = model
+    ? `${model.label}, ${model.camera_model}, ${model.renderer}, ${model.tile_mode}, ${model.num_views} views`
+    : "no model loaded";
+  if (model) element("ckpt-select").value = model.id;
+}
+
+async function postJson(url, body, status) {
+  element(status).textContent = "working ...";
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    element(status).textContent = `failed: ${response.status} ${await response.text()}`;
+    return null;
+  }
+  return response.json();
+}
+
+async function loadModel() {
+  const data = await postJson("/api/load_model", { id: element("ckpt-select").value }, "ckpt-status");
+  if (!data) return;
+  showModel(data.model);
+  element("ckpt-status").textContent += `, loaded in ${data.seconds.toFixed(1)} s`;
+}
+
+function adoptReconstruction(data) {
+  if (!data) return;
+  if (data.scenes) fillSelect("scene-select", data.scenes, (e) => e.id, (e) => e.label);
+  state.depthAvailable = Boolean(data.depth_available);
+  element("depth-row").hidden = !state.depthAvailable;
+  adoptScene(data.scene);
+  element("scene-status").textContent += `, reconstructed in ${data.seconds.toFixed(1)} s`;
+}
+
+async function uploadAndReconstruct() {
+  const files = element("upload-files").files;
+  if (!files || files.length === 0) {
+    element("scene-status").textContent = "pick some images first";
+    return;
+  }
+  const form = new FormData();
+  for (const file of files) form.append("files", file);
+  element("scene-status").textContent = `uploading ${files.length} images ...`;
+  const upload = await fetch("/api/upload", { method: "POST", body: form });
+  if (!upload.ok) {
+    element("scene-status").textContent = `upload failed: ${upload.status} ${await upload.text()}`;
+    return;
+  }
+  const { upload_id } = await upload.json();
+  adoptReconstruction(await postJson("/api/reconstruct", { mode: "upload", upload_id }, "scene-status"));
+}
+
+async function reconstructTartanair() {
+  const body = { mode: "tartanair", env: element("env-select").value, index: Number(element("env-index").value) };
+  adoptReconstruction(await postJson("/api/reconstruct", body, "scene-status"));
+}
+
+function syncSource() {
+  const source = document.querySelector("input[name=source]:checked").value;
+  ["precomputed", "upload", "tartanair"].forEach((name) => {
+    element(`source-${name}`).hidden = name !== source;
+  });
+}
+
 async function saveImage() {
   element("save-status").textContent = "saving ...";
   const body = currentRequest();
@@ -374,6 +449,11 @@ async function saveImage() {
 }
 
 element("scene-load").addEventListener("click", loadScene);
+element("ckpt-load").addEventListener("click", loadModel);
+element("upload-run").addEventListener("click", uploadAndReconstruct);
+element("tartanair-run").addEventListener("click", reconstructTartanair);
+document.querySelectorAll("input[name=source]").forEach((input) =>
+  input.addEventListener("change", syncSource));
 element("reset-view").addEventListener("click", resetView);
 element("save-image").addEventListener("click", saveImage);
 element("fov").addEventListener("input", () => { showFov(Number(element("fov").value), 0, 0); markMoving(); });
@@ -388,5 +468,5 @@ document.querySelectorAll("input[name=view]").forEach((input) =>
 
 fetch("/api/state")
   .then((response) => response.json())
-  .then((data) => { applyState(data); syncCameraControls(false); loop(); })
+  .then((data) => { applyState(data); syncSource(); syncCameraControls(false); loop(); })
   .catch((error) => { element("stats").textContent = `cannot reach the server: ${error}`; });

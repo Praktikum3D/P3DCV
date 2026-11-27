@@ -11,9 +11,38 @@
   <h1>3DGEER viewer</h1>
 
   <section>
+    <h2>Model</h2>
+    <select id="ckpt-select"></select>
+    <button id="ckpt-load">Load model</button>
+    <p class="status" id="ckpt-status">no model loaded</p>
+  </section>
+
+  <section>
     <h2>Scene</h2>
-    <select id="scene-select"></select>
-    <button id="scene-load">Load scene</button>
+    <div class="radios" id="source">
+      <label><input type="radio" name="source" value="precomputed" checked> precomputed</label>
+      <label><input type="radio" name="source" value="upload"> upload</label>
+      <label><input type="radio" name="source" value="tartanair"> TartanAir</label>
+    </div>
+
+    <div id="source-precomputed">
+      <select id="scene-select"></select>
+      <button id="scene-load">Load scene</button>
+    </div>
+
+    <div id="source-upload" hidden>
+      <input type="file" id="upload-files" multiple accept="image/*">
+      <button id="upload-run">Upload and reconstruct</button>
+    </div>
+
+    <div id="source-tartanair" hidden>
+      <select id="env-select"></select>
+      <label class="row">Sample index
+        <input type="number" id="env-index" value="0" min="0" step="1">
+      </label>
+      <button id="tartanair-run">Reconstruct</button>
+    </div>
+
     <p class="status" id="scene-status">no scene</p>
   </section>
 
