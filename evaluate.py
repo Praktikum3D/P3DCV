@@ -18,7 +18,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 import erayzer_core  # noqa: F401
-from erayzer_core.model.utils_gaussian import render_mask
+from erayzer_core.model.utils_gaussian import loss_render_mask
 from erayzer_core.utils.camera_eval import evaluate_camera_pose_metrics
 from training.datasets import build_dataset as build_config_dataset
 
@@ -185,9 +185,8 @@ def main() -> None:
             if camera_model != "pinhole":  # same pixels as the training loss
                 b, v, c, h, w = pred.shape
                 fxfycxcy = result.fxfycxcy_target.float().reshape(b * v, -1)
-                circle = "fish" in str(config.dataset.get("camera_name", ""))
-                # 3DGEER too only guarantees coverage below 90 degrees, so the mask is the same for both renderers.
-                mask = render_mask(fxfycxcy, h, w, camera_model, circle).reshape(b, v, 1, h, w)
+                # One mask for training and evaluation, as far out as the renderer in the config reaches.
+                mask = loss_render_mask(config, fxfycxcy, h, w).reshape(b, v, 1, h, w)
                 mse_per_image = ((pred - target).pow(2) * mask).flatten(2).sum(2) / (mask.flatten(2).sum(2) * c).clamp_min(1.0)
             else:
                 mse_per_image = (pred - target).pow(2).flatten(2).mean(dim=2)

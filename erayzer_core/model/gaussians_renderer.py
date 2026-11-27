@@ -768,7 +768,8 @@ def render_opencv_cam_gsplat(
 
 
 def render_opencv_cam_geer(pc, height, width, C2W, fxfycxcy, sh_degree, near_plane=0.01, camera_model="fisheye",
-                           radial_coeffs=None, bg_color=(1.0, 1.0, 1.0), ray_camera_model=None):
+                           radial_coeffs=None, bg_color=(1.0, 1.0, 1.0), ray_camera_model=None,
+                           geer_tile_mode="pbf"):
     """Exact ray Gaussian rendering with 3DGEER (needs the gsplat-geer build of gsplat).
 
     The ray of every pixel is built here in PyTorch from C2W and fxfycxcy and handed to the rasterizer,
@@ -778,7 +779,11 @@ def render_opencv_cam_geer(pc, height, width, C2W, fxfycxcy, sh_degree, near_pla
     with radial_coeffs [v, 4], zeros give the equidistant model) only describe the projection 3DGEER
     uses to assign tiles and to cull, which is why UCM renders as a Kannala Brandt fisheye fitted to it;
     ray_camera_model ("pinhole", "fisheye" or "ucm", defaults to camera_model) builds the real rays.
-    View dependent colors are evaluated here. Renders one view at a time, as 3DGEER requires.
+    geer_tile_mode picks how 3DGEER assigns the Gaussians to tiles: "pbf" is its own bounding function in
+    tangent space, which culls everything behind the camera plane and so renders nothing beyond 90 degrees
+    off axis, while "projection" projects the centres with the camera model above and therefore fills a
+    fisheye image out to its border. View dependent colors are evaluated here. Renders one view at a time,
+    as 3DGEER requires.
     """
     from .utils_gaussian import camera_rays  # here, because utils_gaussian imports this module
 
@@ -800,7 +805,7 @@ def render_opencv_cam_geer(pc, height, width, C2W, fxfycxcy, sh_degree, near_pla
                 means, quats, scales, opacity, colors[None], W2C[j:j + 1], K,
                 width, height, near_plane=near_plane, packed=False, backgrounds=bg, camera_model=camera_model,
                 radial_coeffs=None if radial_coeffs is None else radial_coeffs[j:j + 1].float().detach(),
-                with_geer=True, with_eval3d=True,
+                with_geer=True, with_eval3d=True, geer_tile_mode=geer_tile_mode,
                 rays_o=rays_o[j:j + 1].contiguous(), rays_d=rays_d[j:j + 1].contiguous(),
             )
             renders.append(out[0])

@@ -51,9 +51,10 @@ def pixel_angles(fxfycxcy, h, w, camera_model, exact=False):
     """Offsets dx, dy from the principal point, their radius, the angle to the optical axis and the pixels
     the camera can render, all [n, h, w]. fxfycxcy [n, 4] in pixels, for UCM [n, 5] with alpha last.
 
-    Both renderers drop everything behind the camera plane (more than 90 degrees off axis), 3DGEER culls the
-    Gaussian centres there and only splat tails reach further. UCM is undefined outside its own image circle.
-    With exact the angle is not capped at all, which the Kannala Brandt fit needs to know its own range.
+    gsplat and 3DGEER in its "pbf" tile mode drop everything behind the camera plane (more than 90 degrees off
+    axis), 3DGEER culls the Gaussian centres there and only splat tails reach further. UCM is undefined outside
+    its own image circle. With exact the angle is not capped at all, which the Kannala Brandt fit needs to know
+    its own range and which 3DGEER in its "projection" tile mode really renders, out to the image border.
     """
     y, x = torch.meshgrid(torch.arange(h, device=fxfycxcy.device), torch.arange(w, device=fxfycxcy.device), indexing="ij")
     dx, dy = x + 0.5 - fxfycxcy[:, 2, None, None], y + 0.5 - fxfycxcy[:, 3, None, None]
@@ -77,6 +78,21 @@ def render_mask(fxfycxcy, h, w, camera_model, image_circle=False, exact=False):
     if image_circle:
         valid = valid & (radius <= w / 2)
     return valid[:, None].float()
+
+
+def loss_render_mask(config, fxfycxcy, h, w):
+    """The pixels the training loss and the evaluation score, [n, 1, h, w]. fxfycxcy [n, 4], UCM [n, 5].
+
+    Both of them call this, so they always mask the same pixels. The mask normally stops at 90 degrees off
+    axis, because neither gsplat nor 3DGEER in its "pbf" tile mode draws anything further out and those
+    pixels would be background without a gradient. With the geer renderer in its "projection" tile mode the
+    renderer fills the whole image circle, so the mask is the camera model's own range instead.
+    """
+    camera_model = config.model.get("camera_model", "pinhole")
+    image_circle = "fish" in str(config.dataset.get("camera_name", ""))
+    beyond_90 = (config.model.get("renderer", "gsplat") == "geer"
+                 and config.model.get("geer_tile_mode", "pbf") == "projection")
+    return render_mask(fxfycxcy, h, w, camera_model, image_circle, exact=beyond_90)
 
 
 def ucm_radial_coeffs(fxfycxcy, h, w):
@@ -172,6 +188,7 @@ class Renderer(nn.Module):
                             pc, height, width, C2W[i], fxfycxcy[i], self.sh_degree, near_plane=near_plane,
                             camera_model="pinhole" if camera_model == "pinhole" else "fisheye", radial_coeffs=radial,
                             ray_camera_model=camera_model,
+                            geer_tile_mode=self.config.model.get("geer_tile_mode", "pbf"),
                         )
                     elif camera_model == "ucm":
                         # gsplat has no UCM. Render an equidistant fisheye image whose focal length keeps every
