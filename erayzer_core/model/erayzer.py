@@ -12,7 +12,7 @@ from .utils_transformer import (
     _init_weights,
     _init_weights_layerwise
 )
-from utils import camera_utils
+from utils import camera_utils, image_mask
 from .utils_pe import get_2d_sincos_pos_embed
 from .utils_rot import rot6d2mat, quat2mat
 from .utils_gaussian import get_point_range_func, Renderer
@@ -123,6 +123,12 @@ class ERayZer(nn.Module):
         self.hh = self.ww = self.config.model.image_tokenizer.image_size // self.config.model.image_tokenizer.patch_size
         self.ph = self.pw = self.config.model.image_tokenizer.patch_size
         self.inference = True
+        # Images with an empty black border (e.g. the corners of a circular
+        # fisheye image): mask it in attention, Gaussians and loss. Off by default.
+        mask_cfg = self.config.model.get("black_border_mask", None) or {}
+        self.black_border_mask = bool(mask_cfg.get("enabled", False))
+        self.black_border_threshold = float(mask_cfg.get("threshold", 0.01))
+        self.black_border_margin = int(mask_cfg.get("margin", 1))
         self.freeze_focal_steps = self.config.training.get(
             "freeze_focal_steps",
             self.config.training.get("no_pass_steps", 0),
@@ -358,6 +364,14 @@ class ERayZer(nn.Module):
             pad_input = False
             v_all = v
 
+        # [b, v_all, 1, h, w] bool (True = valid pixel) or None if every pixel is valid
+        pixel_valid_all = self._pixel_valid_mask(data, image_data_all, v_all)
+        pose_token_valid = None
+        if pixel_valid_all is not None:
+            patch_valid = image_mask.patch_valid_mask(pixel_valid_all, self.ph)          # [b, v_all, n]
+            special = patch_valid.new_ones(b, v_all, 1 + self.num_register_tokens)
+            pose_token_valid = torch.cat([special, patch_valid], dim=-1)                # [b, v_all, 1+4+n]
+
         '''se3 pose prediction for all views'''
         # tokenize images, add spatial-temporal p.e.
         img_tokens = self.image_tokenizer(image_all)                              # [b*v_all, n, d]
@@ -381,7 +395,7 @@ class ERayZer(nn.Module):
         all_tokens = rearrange(all_tokens, '(b v) n d -> b (v n) d', b=b)         # [b, v_all*n, d]
 
         # pose estimation for all views
-        all_tokens = self.run_vggt_encoder(all_tokens, b, v_all)
+        all_tokens = self.run_vggt_encoder(all_tokens, b, v_all, token_valid=pose_token_valid)
         all_tokens = rearrange(all_tokens, 'b (v n) d -> (b v) n d', v=v_all)
         cam_tokens, _, _ = all_tokens.split([1, self.num_register_tokens, n], dim=1) 
 
@@ -414,6 +428,11 @@ class ERayZer(nn.Module):
         fxfycxcy_target = pred_fxfycxcy[batch_idx, target_idx].clone()          # [b, v_target, 4]
         target_image = image_data_all[batch_idx, target_idx]
         v_input = input_idx.shape[1]
+        input_pixel_valid = target_pixel_valid = geom_token_valid = None
+        if pixel_valid_all is not None:
+            input_pixel_valid = pixel_valid_all[batch_idx, input_idx]             # [b, v_input, 1, h, w]
+            target_pixel_valid = pixel_valid_all[batch_idx, target_idx]           # [b, v_target, 1, h, w]
+            geom_token_valid = image_mask.patch_valid_mask(input_pixel_valid, self.ph)  # [b, v_input, n]
     
         plucker_rays_input = cam_info_to_plucker(c2w_input, fxfycxcy_input, self.config.model.target_image, normalized=normalized, return_moment=True)
         plucker_rays_input = rearrange(plucker_rays_input, '(b v) c h w -> b v h w c', b=b, v=v_input)
@@ -434,7 +453,7 @@ class ERayZer(nn.Module):
         all_tokens = self.mlp_fuse(img_tokens_input)                                                          # [b, v_input*n, d]
 
         # encoder layers, predict depths and feature vectors
-        all_tokens = self.run_vggt_encoder_geom(all_tokens, b, v_input)                                                   # [b, v_input*n, d]
+        all_tokens = self.run_vggt_encoder_geom(all_tokens, b, v_input, token_valid=geom_token_valid)                     # [b, v_input*n, d]
         img_aligned_gaussians = self.image_token_decoder(all_tokens)
         img_aligned_gaussians = rearrange(
             img_aligned_gaussians,
@@ -448,6 +467,10 @@ class ERayZer(nn.Module):
             pw=self.pw,
         )
         xyz, features, scaling, rotation, opacity = self.upsampler.to_gs(img_aligned_gaussians)
+        if input_pixel_valid is not None:
+            # no Gaussians from the empty border: invisible and without gradient
+            gs_valid = image_mask.gaussian_valid_mask(input_pixel_valid, self.ph)       # [b, v_input*h*w, 1]
+            opacity = torch.where(gs_valid, opacity, opacity.new_tensor(image_mask.INVALID_OPACITY_LOGIT))
         img_aligned_xyz = rearrange(
             xyz,
             "b (v hh ww ph pw) c -> b v c (hh ph) (ww pw)",
@@ -575,12 +598,37 @@ class ERayZer(nn.Module):
             fxfycxcy_target=fxfycxcy_target,
             input_idx=input_idx,
             target_idx=target_idx,
+            # [b, v, 1, h, w] bool, True = valid pixel; None if every pixel is valid
+            input_mask=input_pixel_valid,
+            target_mask=target_pixel_valid,
         )
 
         if vis_only_results is not None:
             result.render_video = vis_only_results.rendered_images_video.detach().clamp(0, 1)
 
         return result
+
+    def _pixel_valid_mask(self, data, image_data_all, v_all):
+        """Valid-pixel mask [b, v_all, 1, h, w] bool, or None if every pixel is valid.
+
+        Taken from data["mask"] ([b, v, 1, h, w], True = valid) if the dataset
+        provides one, else computed from the images when
+        config.model.black_border_mask.enabled (black pixels connected to the
+        image border are invalid, see utils/image_mask.py).
+        """
+        if data.get("mask") is not None:
+            mask = data["mask"].to(device=image_data_all.device, dtype=torch.bool)
+            if mask.shape[1] < v_all:  # padded views repeat the last one
+                mask = torch.cat([mask, mask[:, -1:].expand(-1, v_all - mask.shape[1], -1, -1, -1)], dim=1)
+        elif self.black_border_mask:
+            mask = image_mask.black_border_mask(
+                image_data_all, threshold=self.black_border_threshold, margin=self.black_border_margin
+            )
+        else:
+            return None
+        if bool(mask.all()):
+            return None
+        return mask
 
     def add_spatial_pe(self, tokens, b, v, h_tokens, w_tokens, embedder):
         """
@@ -638,8 +686,13 @@ class ERayZer(nn.Module):
         combined = combined.view(B * S, *combined.shape[2:])
         return combined
 
-    def run_vggt_encoder(self, all_tokens_encoder, b, v):
+    def run_vggt_encoder(self, all_tokens_encoder, b, v, token_valid=None):
+        """token_valid: optional [b, v, l] bool, False for tokens not to attend to."""
         checkpoint_every = self.config.training.grad_checkpoint_every
+        frame_mask = global_mask = None
+        if token_valid is not None:
+            frame_mask = image_mask.attention_key_mask(rearrange(token_valid, 'b v l -> (b v) l'))
+            global_mask = image_mask.attention_key_mask(rearrange(token_valid, 'b v l -> b (v l)'))
         for i in range(0, len(self.transformer_encoder), checkpoint_every):
             if i % 2 == 0:
                 # frame attention
@@ -648,17 +701,24 @@ class ERayZer(nn.Module):
                 # global attention
                 all_tokens_encoder = rearrange(all_tokens_encoder, '(b v) n d -> b (v n) d', b=b)
 
+            key_mask = frame_mask if i % 2 == 0 else global_mask
             all_tokens_encoder = torch.utils.checkpoint.checkpoint(
                 self.run_layers_encoder(i, i+1),
                 all_tokens_encoder,
+                key_mask,
                 use_reentrant=False,
             )
             if checkpoint_every > 1:
-                all_tokens_encoder = self.run_layers_encoder(i + 1, i + checkpoint_every)(all_tokens_encoder)
+                all_tokens_encoder = self.run_layers_encoder(i + 1, i + checkpoint_every)(all_tokens_encoder, key_mask)
         return all_tokens_encoder
     
-    def run_vggt_encoder_geom(self, all_tokens_encoder, b, v):
+    def run_vggt_encoder_geom(self, all_tokens_encoder, b, v, token_valid=None):
+        """token_valid: optional [b, v, l] bool, False for tokens not to attend to."""
         checkpoint_every = self.config.training.grad_checkpoint_every
+        frame_mask = global_mask = None
+        if token_valid is not None:
+            frame_mask = image_mask.attention_key_mask(rearrange(token_valid, 'b v l -> (b v) l'))
+            global_mask = image_mask.attention_key_mask(rearrange(token_valid, 'b v l -> b (v l)'))
         for i in range(0, len(self.transformer_encoder_geom), checkpoint_every):
             if i % 2 == 0:
                 # frame attention
@@ -667,26 +727,28 @@ class ERayZer(nn.Module):
                 # global attention
                 all_tokens_encoder = rearrange(all_tokens_encoder, '(b v) n d -> b (v n) d', b=b)
 
+            key_mask = frame_mask if i % 2 == 0 else global_mask
             all_tokens_encoder = torch.utils.checkpoint.checkpoint(
                 self.run_layers_encoder_geom(i, i+1),
                 all_tokens_encoder,
+                key_mask,
                 use_reentrant=False,
             )
             if checkpoint_every > 1:
-                all_tokens_encoder = self.run_layers_encoder_geom(i + 1, i + checkpoint_every)(all_tokens_encoder)
+                all_tokens_encoder = self.run_layers_encoder_geom(i + 1, i + checkpoint_every)(all_tokens_encoder, key_mask)
         return all_tokens_encoder
 
     def run_layers_encoder(self, start, end):
-        def custom_forward(concat_nerf_img_tokens):
+        def custom_forward(concat_nerf_img_tokens, key_mask=None):
             for i in range(start, min(end, len(self.transformer_encoder))):
-                concat_nerf_img_tokens = self.transformer_encoder[i](concat_nerf_img_tokens)
+                concat_nerf_img_tokens = self.transformer_encoder[i](concat_nerf_img_tokens, key_mask=key_mask)
             return concat_nerf_img_tokens
         return custom_forward
     
     def run_layers_encoder_geom(self, start, end):
-        def custom_forward(concat_nerf_img_tokens):
+        def custom_forward(concat_nerf_img_tokens, key_mask=None):
             for i in range(start, min(end, len(self.transformer_encoder_geom))):
-                concat_nerf_img_tokens = self.transformer_encoder_geom[i](concat_nerf_img_tokens)
+                concat_nerf_img_tokens = self.transformer_encoder_geom[i](concat_nerf_img_tokens, key_mask=key_mask)
             return concat_nerf_img_tokens
         return custom_forward
 

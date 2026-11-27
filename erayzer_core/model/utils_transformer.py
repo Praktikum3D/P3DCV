@@ -261,10 +261,15 @@ class QK_Norm_SelfAttention(nn.Module):
             self.q_norm = RMSNorm(d_head)
             self.k_norm = RMSNorm(d_head)
 
-    def forward(self, x, attn_bias=None):
+    def forward(self, x, attn_bias=None, key_mask=None):
         """
         x: (b, l, d)
         attn_bias: xformers BlockDiagonalMask
+        key_mask: optional (b, l) bool, False for tokens that must not be
+            attended to (e.g. patches of the empty black border of an image).
+            Every row needs at least one True. With a mask the attention runs
+            through torch's scaled_dot_product_attention; without one it is
+            unchanged (xformers flash attention).
         """
         # token split, multi-head attention, token cat
         q, k, v = self.to_qkv(x).split(self.d, dim=2)
@@ -276,6 +281,19 @@ class QK_Norm_SelfAttention(nn.Module):
         if self.use_qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
+
+        if key_mask is not None:
+            assert attn_bias is None, "key_mask and attn_bias cannot be combined"
+            q, k, v = (t.transpose(1, 2) for t in (q, k, v))  # (b, nh, l, dh)
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=key_mask[:, None, None, :],
+                dropout_p=self.attn_dropout if self.training else 0.0,
+            )
+            x = rearrange(x, "b nh l dh -> b l (nh dh)")
+            return self.attn_fc_dropout(self.fc(x))
 
         # The memory_efficient_attention takes the input as (batch, seq_len, heads, dim)
         x = xops.memory_efficient_attention(
@@ -791,8 +809,9 @@ class QK_Norm_TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d, bias=ln_bias)
         self.mlp = MLP(d, mlp_ratio, mlp_bias, mlp_dropout)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x, key_mask=None):
+        """key_mask: optional (b, l) bool, see QK_Norm_SelfAttention."""
+        x = x + self.attn(self.norm1(x), key_mask=key_mask)
         x = x + self.mlp(self.norm2(x))
         return x
 

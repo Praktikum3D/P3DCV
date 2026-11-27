@@ -252,8 +252,24 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
             align_corners=False,
         ).reshape(b, v, target.shape[2], pred.shape[-2], pred.shape[-1])
 
-    mse = F.mse_loss(pred, target)
-    l1 = F.l1_loss(pred, target)
+    mask = result.get("target_mask")  # [b, v, 1, h, w] bool (True = valid) or None
+    if mask is None:
+        mse = F.mse_loss(pred, target)
+        l1 = F.l1_loss(pred, target)
+    else:
+        # Ignore the empty black border of the targets (see utils/image_mask.py):
+        # averages over valid pixels only, and the perceptual loss sees the
+        # target in the invalid region, so neither pushes the render towards black.
+        if mask.shape[-2:] != pred.shape[-2:]:
+            b, v = mask.shape[:2]
+            mask = F.interpolate(
+                mask.reshape(b * v, 1, *mask.shape[-2:]).float(), size=pred.shape[-2:], mode="nearest"
+            ).reshape(b, v, 1, *pred.shape[-2:]) > 0.5
+        m = mask.to(pred.dtype)
+        count = (m.sum() * pred.shape[2]).clamp_min(1.0)
+        mse = ((pred - target).pow(2) * m).sum() / count
+        l1 = ((pred - target).abs() * m).sum() / count
+        pred = torch.where(mask, pred, target)
     perceptual = pred.new_tensor(0.0)
     if hasattr(loss_modules, "perceptual"):
         b, v, c, h, w = pred.shape

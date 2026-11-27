@@ -180,7 +180,19 @@ def main() -> None:
                     align_corners=False,
                 ).reshape(b, v, target.shape[2], pred.shape[-2], pred.shape[-1])
 
-            mse_per_image = (pred - target).pow(2).flatten(2).mean(dim=2)
+            mask = result.get("target_mask")  # [b, v, 1, h, w] bool (True = valid) or None
+            if mask is None:
+                mse_per_image = (pred - target).pow(2).flatten(2).mean(dim=2)
+            else:
+                # PSNR over the valid pixels only (empty black border excluded)
+                if mask.shape[-2:] != pred.shape[-2:]:
+                    b, v = mask.shape[:2]
+                    mask = F.interpolate(
+                        mask.reshape(b * v, 1, *mask.shape[-2:]).float(), size=pred.shape[-2:], mode="nearest"
+                    ).reshape(b, v, 1, *pred.shape[-2:]) > 0.5
+                m = mask.to(pred.dtype).expand_as(pred)
+                mse_per_image = ((pred - target).pow(2) * m).flatten(2).sum(dim=2) / m.flatten(2).sum(dim=2).clamp_min(1.0)
+                pred = torch.where(mask, pred, torch.zeros_like(pred))  # saved examples: border black
             mse_sum += mse_per_image.sum()
             image_count += mse_per_image.numel()
             psnr_per_image = -10.0 * torch.log10(mse_per_image.clamp_min(1e-8))

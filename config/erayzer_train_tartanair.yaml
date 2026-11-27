@@ -52,6 +52,14 @@ model:
       upsample_factor: 1
   gs_per_pixel_sqrt: 1
   hard_pixelalign: true
+  # lcam_fish is a 195 deg image circle inside a square image: its corners are
+  # black. Mask them: no attention to fully black patches, no Gaussians from
+  # black pixels, no loss on them (see erayzer_core/utils/image_mask.py).
+  # Only black regions connected to the image border are masked.
+  black_border_mask:
+    enabled: true
+    threshold: 0.01  # black: every channel <= threshold (images in [0, 1])
+    margin: 1        # also drop this many pixels of the blurred rim of the circle
 
 training:
   dataset: tartanair
