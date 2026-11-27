@@ -69,6 +69,7 @@ def render_view(
     if view not in VIEWS:
         raise ValueError(f"unknown view {view!r}")
     device = scene.pc.get_xyz.device
+    c2w = c2w.to(device=device, dtype=torch.float32)
     fxfycxcy, fov_used = fov_to_fxfycxcy(camera_model, fov_deg, alpha, w, h, device=device)
     arguments = geer_camera_arguments(camera_model, fxfycxcy, h, w)
 
@@ -78,7 +79,7 @@ def render_view(
             scene.pc,
             h,
             w,
-            c2w[None].to(device).float(),
+            c2w[None],
             fxfycxcy,
             scene.sh_degree,
             near_plane=scene.near_plane,
@@ -126,7 +127,8 @@ def draw_frusta(rgb: np.ndarray, scene: Scene, c2w: torch.Tensor, fxfycxcy: torc
     h, w = rgb.shape[:2]
     bgr = np.ascontiguousarray(rgb[:, :, ::-1])
     margin = 2.0 * float(np.hypot(h, w))
-    device = c2w.device
+    device = fxfycxcy.device  # the scene lives there, the pose may still be on the host
+    c2w = c2w.to(device=device, dtype=torch.float32)
     input_h, input_w = scene.input_hw
     pixels = scene.fxfycxcy_input.clone().to(device)
     pixels[:, 0] *= input_w
@@ -141,7 +143,7 @@ def draw_frusta(rgb: np.ndarray, scene: Scene, c2w: torch.Tensor, fxfycxcy: torc
             scene.c2w_input[index].to(device), pixels[index], input_h, input_w, scene.camera_model, depth
         )
         for segment in segments:
-            uv, valid = project_points(torch.from_numpy(segment).to(device), c2w.to(device), fxfycxcy, camera_model)
+            uv, valid = project_points(torch.from_numpy(segment).to(device), c2w, fxfycxcy, camera_model)
             uv = uv.cpu().numpy()
             inside = valid.cpu().numpy() & (np.abs(uv[:, 0] + 0.5 - w / 2) < w / 2 + margin)
             inside &= np.abs(uv[:, 1] + 0.5 - h / 2) < h / 2 + margin
@@ -149,7 +151,7 @@ def draw_frusta(rgb: np.ndarray, scene: Scene, c2w: torch.Tensor, fxfycxcy: torc
                 if len(run) >= 2:
                     cv2.polylines(bgr, [np.round(uv[run]).astype(np.int32)], False, color, 1, cv2.LINE_AA)
         apex, apex_valid = project_points(
-            scene.c2w_input[index, :3, 3][None].to(device), c2w.to(device), fxfycxcy, camera_model
+            scene.c2w_input[index, :3, 3][None].to(device), c2w, fxfycxcy, camera_model
         )
         if bool(apex_valid[0]):
             x, y = apex[0].cpu().numpy()
