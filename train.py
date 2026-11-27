@@ -160,6 +160,17 @@ def build_dataloader(config: edict, rank: int, world_size: int) -> Tuple[torch.u
     return dataset, dataloader
 
 
+# The camera heads of the model: canonical_k_head predicts the focal length, alpha_head the UCM alpha
+# (the latter only exists for model.camera_model == ucm). Matching the names as substrings keeps the
+# partition working through the module. prefix of DDP and the pose_predictor. prefix of PoseEstimator.
+CAMERA_HEAD_NAMES = ("canonical_k_head", "alpha_head")
+
+
+def is_camera_parameter(name: str) -> bool:
+    """True for a parameter of one of the camera heads, see CAMERA_HEAD_NAMES."""
+    return any(head in name for head in CAMERA_HEAD_NAMES)
+
+
 def configure_optimizer(
     model: torch.nn.Module,
     weight_decay: float,
@@ -167,12 +178,23 @@ def configure_optimizer(
     betas: tuple[float, float],
 ) -> torch.optim.Optimizer:
     param_dict = {name: param for name, param in model.named_parameters() if param.requires_grad}
-    decay_params = [param for param in param_dict.values() if param.dim() >= 2]
-    nodecay_params = [param for param in param_dict.values() if param.dim() < 2]
-    optim_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0},
+    # The camera heads become their own groups so the learning rate schedule can treat them separately.
+    # Within each half the split by dimension decides the weight decay exactly as it did before.
+    decay_params, nodecay_params, camera_decay_params, camera_nodecay_params = [], [], [], []
+    for name, param in param_dict.items():
+        camera = is_camera_parameter(name)
+        if param.dim() >= 2:
+            (camera_decay_params if camera else decay_params).append(param)
+        else:
+            (camera_nodecay_params if camera else nodecay_params).append(param)
+    candidates = [
+        {"name": "decay", "params": decay_params, "weight_decay": weight_decay},
+        {"name": "nodecay", "params": nodecay_params, "weight_decay": 0.0},
+        {"name": "camera_decay", "params": camera_decay_params, "weight_decay": weight_decay},
+        {"name": "camera_nodecay", "params": camera_nodecay_params, "weight_decay": 0.0},
     ]
+    # Fused AdamW rejects empty groups, and train/lr logs param_groups[0], which stays the main decay group.
+    optim_groups = [group for group in candidates if len(group["params"]) > 0]
     fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
     try:
         first_param = next(model.parameters())
@@ -207,14 +229,33 @@ def get_job_overview(
     )
 
 
+def fwdbwd_passes_to_param_updates(fwdbwd_passes: int, grad_accum_steps: int) -> int:
+    """Forward/backward passes, the unit of max_fwdbwd_passes, into the parameter updates the scheduler counts."""
+    fwdbwd_passes = max(0, int(fwdbwd_passes))
+    grad_accum_steps = max(1, int(grad_accum_steps))
+    return -(-fwdbwd_passes // grad_accum_steps)
+
+
 def configure_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     total_train_steps: int,
     warmup_steps: int,
     scheduler_type: str = "cosine",
+    camera_lr_scale: float = 1.0,
+    camera_lr_decay_updates: int = 0,
 ) -> torch.optim.lr_scheduler.LambdaLR:
+    """Warmup plus decay for every group, with an extra factor on the camera head groups.
+
+    The camera learning rate is camera_lr(t) = lr(t) * camera_lr_scale * decay(t) with a cosine decay
+    from 1 to 0 over camera_lr_decay_updates parameter updates and exactly 0 afterwards. The focal
+    length and the UCM alpha reach their correct value early and drift away over the rest of a long
+    run, so freezing them after the healthy phase keeps them there. camera_lr_decay_updates is counted
+    in parameter updates, the unit the scheduler ticks in, not in forward/backward passes.
+    """
     total_train_steps = max(1, int(total_train_steps))
     warmup_steps = max(0, int(warmup_steps))
+    camera_lr_scale = float(camera_lr_scale)
+    camera_lr_decay_updates = max(0, int(camera_lr_decay_updates))
 
     def lr_lambda(current_step: int) -> float:
         if warmup_steps > 0 and current_step < warmup_steps:
@@ -229,7 +270,23 @@ def configure_lr_scheduler(
             return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
         raise ValueError(f"Unsupported training.scheduler_type: {scheduler_type}")
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    def camera_lr_lambda(current_step: int) -> float:
+        factor = lr_lambda(current_step)
+        if camera_lr_decay_updates > 0:
+            if current_step >= camera_lr_decay_updates:
+                return 0.0
+            factor = factor * 0.5 * (1.0 + math.cos(math.pi * float(current_step) / float(camera_lr_decay_updates)))
+        if camera_lr_scale != 1.0:
+            factor = factor * camera_lr_scale
+        return factor
+
+    # One lambda per group, in the order of optimizer.param_groups. With the defaults the camera
+    # lambda returns the very same floats as the base one, so nothing about training changes.
+    lr_lambdas = [
+        camera_lr_lambda if str(group.get("name", "")).startswith("camera") else lr_lambda
+        for group in optimizer.param_groups
+    ]
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambdas)
 
 
 def build_loss_modules(config: edict, device: torch.device) -> edict:
@@ -410,6 +467,12 @@ def main() -> None:
         job_overview.num_param_updates,
         int(config.training.get("warmup", 0)),
         str(config.training.get("scheduler_type", "cosine")),
+        camera_lr_scale=float(config.training.get("camera_lr_scale", 1.0)),
+        # training.camera_lr_decay_steps counts forward/backward passes like max_fwdbwd_passes, the
+        # scheduler ticks once per parameter update, so round up to cover the requested passes.
+        camera_lr_decay_updates=fwdbwd_passes_to_param_updates(
+            int(config.training.get("camera_lr_decay_steps", 0)), grad_accum
+        ),
     )
     resume_ckpt = config.training.get("resume_ckpt")
     step = 0
@@ -520,6 +583,14 @@ def main() -> None:
             epoch_steps += 1
             if is_rank0(rank) and (step == 1 or step % int(config.training.get("print_every", 20)) == 0):
                 elapsed = time.time() - start_time
+                camera_lr = next(
+                    (
+                        group["lr"]
+                        for group in optimizer.param_groups
+                        if str(group.get("name", "")).startswith("camera")
+                    ),
+                    optimizer.param_groups[0]["lr"],
+                )
                 print(
                     f"step {step}/{max_steps} "
                     f"param_update_step={param_update_step} "
@@ -529,6 +600,7 @@ def main() -> None:
                     f"perceptual={metrics.perceptual.item():.6f} "
                     f"psnr={metrics.psnr.item():.2f} "
                     f"lr={optimizer.param_groups[0]['lr']:.8f} "
+                    f"camera_lr={camera_lr:.8f} "
                     f"grad_norm={float(grad_norm):.3f} "
                     f"time={elapsed:.1f}s"
                 )
@@ -540,6 +612,7 @@ def main() -> None:
                         "train/perceptual": metrics.perceptual.item(),
                         "train/psnr": metrics.psnr.item(),
                         "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/camera_lr": camera_lr,
                         "train/grad_norm": float(grad_norm),
                         "train/param_update_step": param_update_step,
                         "train/mask_fraction": metrics.mask_fraction.item(),

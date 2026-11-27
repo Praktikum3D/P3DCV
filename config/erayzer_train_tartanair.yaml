@@ -91,6 +91,11 @@ training:
   weight_decay: 0.05
   warmup: 500
   scheduler_type: cosine
+  # Learning rate of the camera heads (focal length and UCM alpha) as a factor of lr, and a cosine
+  # decay of that factor to zero over this many forward/backward passes (unit of max_fwdbwd_passes,
+  # 0 turns the decay off). The defaults 1.0 and 0 reproduce the schedule the other parameters get.
+  camera_lr_scale: 1.0
+  camera_lr_decay_steps: 0
   grad_accum_steps: 4
   grad_clip_norm: 1.0
   # Steps with a gradient norm above grad_clip_norm times this factor are skipped (default 2 skipped
