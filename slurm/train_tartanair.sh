@@ -47,6 +47,10 @@ VIS_EVERY="${VIS_EVERY:-500}"
 # The fisheye F_SCALE turns the focal length of erayzer_multi.pt on TartanAir (about 1.1) into
 # px per radian near 195 degrees (0.29).
 CAMERA_MODEL="${CAMERA_MODEL:-pinhole}"
+# How 3DGEER assigns its tiles (only used with RENDERER=geer): pbf is its own bounding function, which
+# renders nothing beyond 90 degrees off axis, projection projects the centres with the camera model and
+# fills a fisheye image out to its border. The loss mask follows and covers the whole image circle then.
+GEER_TILE_MODE="${GEER_TILE_MODE:-pbf}"
 # A small near plane keeps fisheye content close to 90 degrees from being dropped.
 if [[ "$CAMERA_MODEL" != pinhole ]]; then F_SCALE="${F_SCALE:-0.26}" NEAR="${NEAR:-0.01}"; else F_SCALE="${F_SCALE:-1.0}" NEAR="${NEAR:-0.2}"; fi
 
@@ -105,6 +109,7 @@ EXTRA_ARGS=(
     -s model.near_plane "$NEAR"
     -s model.alpha_init "${ALPHA_INIT:-0.62}"
     -s model.renderer "${RENDERER:-gsplat}"
+    -s model.geer_tile_mode "$GEER_TILE_MODE"
     "$@"
 )
 if [[ -n "$WANDB_PROJECT" ]]; then

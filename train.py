@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import erayzer_core  # noqa: F401  # registers model.* and utils.* aliases
 from erayzer_core.losses import PerceptualLoss
-from erayzer_core.model.utils_gaussian import camera_theta, render_mask
+from erayzer_core.model.utils_gaussian import camera_theta, loss_render_mask
 from training.datasets import build_dataset as build_config_dataset
 
 
@@ -313,12 +313,13 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
     inside = 1.0
     camera_model = config.model.get("camera_model", "pinhole")
     if camera_model != "pinhole":
-        # Only pixels the camera can render count, for fisheye data only inside the image circle. 3DGEER too
-        # only guarantees coverage below 90 degrees, beyond that it culls the Gaussian centres and merely splat
-        # tails reach, so those pixels stay background without a gradient and must not contribute to the loss.
+        # Only pixels the camera can render count, for fisheye data only inside the image circle, and only as
+        # far out as the renderer in use reaches. Everything the renderer leaves at the background colour has
+        # no gradient and must not contribute to the loss, which is why loss_render_mask stops at 90 degrees
+        # unless 3DGEER assigns its tiles by projection. The evaluation scores the very same pixels.
         b, v, _, h, w = pred.shape
         fxfycxcy = result.fxfycxcy_target.detach().float().reshape(b * v, -1)
-        mask = render_mask(fxfycxcy, h, w, camera_model, "fish" in str(config.dataset.get("camera_name", "")))
+        mask = loss_render_mask(config, fxfycxcy, h, w)
         mask = mask.reshape(b, v, 1, h, w).to(pred.dtype)
         pred, inside = pred * mask + target * (1 - mask), max(mask.mean().item(), 1e-3)
     mse = F.mse_loss(pred, target) / inside

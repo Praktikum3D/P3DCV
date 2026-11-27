@@ -55,6 +55,9 @@ model:
   # mask_input_corners hides the Gaussians of the black fisheye corners, which no loss ever sees. It
   # defaults to on for a "fish" camera_name with a non pinhole camera_model, set it here or with
   # -s model.mask_input_corners False to override that.
+  # geer_tile_mode picks how the geer renderer assigns its tiles, "pbf" (the default, nothing beyond 90
+  # degrees off axis) or "projection" (a fisheye image out to its border, and a loss mask to match). It
+  # only matters with -s model.renderer geer, set it with -s model.geer_tile_mode projection.
 
 training:
   dataset: tartanair
