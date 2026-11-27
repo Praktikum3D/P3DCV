@@ -28,6 +28,7 @@ two more in parallel. All logs go to `~/runs`.
 | [docs/inference.md](docs/inference.md) | Running the pretrained model |
 | [docs/evaluation.md](docs/evaluation.md) | Reproducing the numbers of the paper |
 | [docs/training.md](docs/training.md) | Pretrained weights and what training needs |
+| [docs/viewer.md](docs/viewer.md) | The interactive 3DGEER viewer in the browser |
 
 ## Layout
 
