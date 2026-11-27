@@ -36,6 +36,11 @@ IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 TRAINING_ONLY_PREFIXES = ("loss_computer.",)
 
 
+class UnsupportedDeviceError(RuntimeError):
+    """This GPU cannot run the model. A separate type, because torch raises RuntimeError for
+    everything else as well and a truncated checkpoint is not a reason to blame the hardware."""
+
+
 @dataclass
 class CheckpointEntry:
     id: str
@@ -256,7 +261,7 @@ def load_model(entry: CheckpointEntry, device: torch.device, repo_root: Optional
     if device.type == "cuda" and amp_dtype is torch.bfloat16 and torch.cuda.get_device_capability(device)[0] < 8:
         name = torch.cuda.get_device_name(device)
         major, minor = torch.cuda.get_device_capability(device)
-        raise RuntimeError(
+        raise UnsupportedDeviceError(
             f"{name} has compute capability {major}.{minor}, and E-RayZer needs 8.0 for its bfloat16 attention, "
             "so the forward pass cannot run here. Reconstruct on the cluster and start the viewer with "
             "--scene <file>, or use --scene synthetic."

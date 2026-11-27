@@ -24,7 +24,7 @@ from fastapi import HTTPException, UploadFile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from viewer import server
-from viewer.scene import CheckpointEntry, ModelBundle, Scene, model_state_dict
+from viewer.scene import ModelBundle, Scene, UnsupportedDeviceError, model_state_dict
 from viewer.server import AppState
 
 # The 32 keys `erayzer_multi.pt` carries beyond the model: the VGG 19 of the perceptual loss of the
@@ -71,15 +71,9 @@ def test_a_bare_state_dict_is_taken_as_it_is():
 
 
 def test_the_standalone_precompute_script_drops_the_same_names():
-    """`notes/viewer/precompute_scene.py` lives outside the repository and must not drift away."""
+    """`scripts/precompute_scene.py` imports nothing of the viewer, so it must not drift away."""
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    candidates = [
-        os.path.expanduser("~/praktikum/notes/viewer/precompute_scene.py"),
-        os.path.join(os.path.dirname(repo), "notes", "viewer", "precompute_scene.py"),
-    ]
-    path = next((candidate for candidate in candidates if os.path.isfile(candidate)), None)
-    if path is None:
-        pytest.skip("the standalone precompute script is not checked out here")
+    path = os.path.join(repo, "scripts", "precompute_scene.py")
     module = types.ModuleType("precompute_scene_probe")
     module.Any = typing.Any  # the slice below is read without the imports of the file around it
     source = open(path, "r", encoding="utf-8").read()
@@ -231,6 +225,19 @@ def test_a_malformed_render_request_is_a_422(app_state, monkeypatch, body, field
     assert field in error.value.detail
 
 
+def test_a_render_that_blows_up_frees_the_gpu_and_names_itself(app_state, monkeypatch):
+    """A failing frame must not reach the client as a bare 500, and it must not keep its memory."""
+
+    def fail(*args, **kwargs):
+        raise ValueError("the kernel disliked this")
+
+    monkeypatch.setattr(server, "render_view", fail)
+    with pytest.raises(HTTPException) as error:
+        server._render_request(app_state, render_body(), full_resolution=False)
+    assert error.value.status_code == 500
+    assert "ValueError" in error.value.detail and "disliked" in error.value.detail
+
+
 def test_rendering_without_a_scene_is_a_409(app_state):
     app_state.scene = None
     with pytest.raises(HTTPException) as error:
@@ -339,13 +346,28 @@ def test_a_gpu_without_bfloat16_says_so_instead_of_crashing(app_state, tmp_path,
     app_state.runs_dir = str(tmp_path / "runs")
 
     def refuse(entry, device, repo_root=None):
-        raise RuntimeError("this GPU has no bfloat16, so the E-RayZer forward pass cannot run here.")
+        raise UnsupportedDeviceError("compute capability 7.5, and E-RayZer needs 8.0 for its bfloat16 attention")
 
     monkeypatch.setattr(server, "load_model", refuse)
     with pytest.raises(HTTPException) as error:
         server.api_load_model({"id": "runs/fish-geer"})
     assert error.value.status_code == 503
     assert "bfloat16" in error.value.detail
+
+
+def test_a_broken_checkpoint_is_not_blamed_on_the_gpu(app_state, tmp_path, monkeypatch):
+    """Torch raises RuntimeError for a truncated file too, and that is a 500, not a 503."""
+    write_run(str(tmp_path), "fish-geer", "fisheye")
+    app_state.runs_dir = str(tmp_path / "runs")
+
+    def truncated(entry, device, repo_root=None):
+        raise RuntimeError("PytorchStreamReader failed reading zip archive")
+
+    monkeypatch.setattr(server, "load_model", truncated)
+    with pytest.raises(HTTPException) as error:
+        server.api_load_model({"id": "runs/fish-geer"})
+    assert error.value.status_code == 500
+    assert "PytorchStreamReader" in error.value.detail
 
 
 def test_loading_a_model_keeps_the_camera_settings_of_its_run(app_state, tmp_path, monkeypatch):

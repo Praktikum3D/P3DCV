@@ -42,6 +42,7 @@ from .scene import (
     CheckpointEntry,
     ModelBundle,
     Scene,
+    UnsupportedDeviceError,
     list_checkpoints,
     list_envs,
     load_model,
@@ -229,7 +230,7 @@ def api_load_model(body: dict = Body(...)):
         started = time.perf_counter()
         try:
             bundle = load_model(entry, app_state.device, repo_root=REPO_ROOT)
-        except RuntimeError as error:  # no bfloat16 on this GPU is the expected one
+        except UnsupportedDeviceError as error:  # the development GPU, nothing wrong with the file
             raise HTTPException(503, str(error))
         except Exception as error:  # a truncated file or a config that does not fit its weights
             raise HTTPException(500, f"loading {entry.ckpt_path} failed, {type(error).__name__}: {error}")
@@ -311,14 +312,18 @@ def api_reconstruct(body: dict = Body(...)):
 
     started = time.perf_counter()
     with app_state.gpu_lock:
+        # Read the model under the lock as well: another tab may have replaced it in between.
+        bundle = app_state.bundle
+        if bundle is None:
+            raise HTTPException(409, "load a checkpoint first")
         app_state.scene, app_state.scene_id = None, ""  # the old scene goes before the new one comes
         if app_state.device.type == "cuda":
             torch.cuda.empty_cache()
         try:
             if mode == "upload":
-                scene = reconstruct_upload(app_state.bundle, paths, app_state.device)
+                scene = reconstruct_upload(bundle, paths, app_state.device)
             else:
-                scene = reconstruct_tartanair(app_state.bundle, envs[env_name], index, app_state.device)
+                scene = reconstruct_tartanair(bundle, envs[env_name], index, app_state.device)
         except (IndexError, ValueError, FileNotFoundError) as error:
             raise HTTPException(422, str(error))
         except torch.cuda.OutOfMemoryError as error:
@@ -404,18 +409,27 @@ def _render_request(app_state: AppState, body: dict, full_resolution: bool):
         raise HTTPException(422, "alpha must lie strictly between 0 and 1")
 
     with app_state.gpu_lock:
-        image, info = render_view(
-            scene,
-            c2w,
-            camera_model,
-            fov_deg,
-            alpha,
-            height,
-            width,
-            tile_mode=tile_mode,
-            view=view,
-            frusta=bool(body.get("frusta", True)),
-        )
+        try:
+            image, info = render_view(
+                scene,
+                c2w,
+                camera_model,
+                fov_deg,
+                alpha,
+                height,
+                width,
+                tile_mode=tile_mode,
+                view=view,
+                frusta=bool(body.get("frusta", True)),
+            )
+        except torch.cuda.OutOfMemoryError as error:
+            # A frame is bounded, but a large scene next to a reconstruction can still run out.
+            torch.cuda.empty_cache()
+            raise HTTPException(507, f"the GPU ran out of memory while rendering, {error}")
+        except Exception as error:
+            if app_state.device.type == "cuda":
+                torch.cuda.empty_cache()
+            raise HTTPException(500, f"the render failed, {type(error).__name__}: {error}")
     app_state.stats.add(height, info["render_ms"])
     if app_state.stats.total % LOG_EVERY == 0:
         print(app_state.stats.line(), flush=True)

@@ -71,7 +71,7 @@ work on a smaller GPU, reconstruct once on the cluster and carry the result:
 
 ```bash
 # on the cluster, inside the container
-python notes/viewer/precompute_scene.py --ckpt <checkpoint> --env HongKong \
+python scripts/precompute_scene.py --ckpt <checkpoint> --env HongKong \
     --data-root /mnt/projects/p3dcv/anycam/data/tartanair --out scene.pt
 
 # anywhere with a GPU
