@@ -35,8 +35,11 @@ writes to `~/runs/inference/<timestamp>/`.
   and can only express a pinhole camera. Fisheye input runs, but the model
   cannot describe its camera correctly. This is the gap the project is about.
 
-Loading a checkpoint prints `Unexpected keys: 32`. These are weights in the
-file that the released model code does not use.
+Loading a checkpoint prints `Unexpected keys: 32`. These are the convolutions
+of the VGG 19 that the original training carried inside the model for its
+perceptual loss, under `loss_computer.perceptual_loss_module`. No model in this
+repository builds it, nothing is missing without it, and the viewer drops those
+names before loading so that a real mismatch stays visible.
 
 ## Interactive demo
 

@@ -28,6 +28,13 @@ CAMERA_KEYS = ("camera_model", "renderer", "geer_tile_mode", "near_plane", "alph
 FALLBACK_CONFIG = "config/erayzer_train_tartanair.yaml"
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
+# Weights that only the original E-RayZer training carried. Its perceptual loss lived inside the
+# model as `loss_computer.perceptual_loss_module`, a VGG 19 with sixteen convolutions, so
+# `erayzer_multi.pt` holds 32 tensors that no model in this repository builds. Those are the
+# "32 unexpected keys" the pretrained load used to report. Dropping them up front leaves a load
+# that says nothing when it went well and names real architecture mismatches when it did not.
+TRAINING_ONLY_PREFIXES = ("loss_computer.",)
+
 
 @dataclass
 class CheckpointEntry:
@@ -211,6 +218,24 @@ def _prepare_config(config: edict) -> edict:
     return config
 
 
+def model_state_dict(checkpoint: Any) -> tuple:
+    """The model weights of a checkpoint, ready for `load_state_dict`, plus the names dropped.
+
+    Three checkpoint shapes reach the viewer: a bare state dict, one wrapped in `{"model": ...}` by
+    `train.py`, and the pretrained `erayzer_multi.pt`, which is the second kind plus the weights of
+    the perceptual loss of its training. Distributed runs prefix every name with `module.`.
+    """
+    raw = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    state, dropped = {}, []
+    for key, value in raw.items():
+        name = key.removeprefix("module.")
+        if name.startswith(TRAINING_ONLY_PREFIXES):
+            dropped.append(name)
+        else:
+            state[name] = value
+    return state, dropped
+
+
 def load_model(entry: CheckpointEntry, device: torch.device, repo_root: Optional[str] = None) -> ModelBundle:
     """Load a checkpoint with the config of its own run, ready for one forward pass."""
     checkpoint = torch.load(entry.ckpt_path, map_location="cpu")
@@ -225,20 +250,32 @@ def load_model(entry: CheckpointEntry, device: torch.device, repo_root: Optional
 
     amp_name = str(config.training.get("amp_dtype", "bf16")).lower()
     amp_dtype = torch.bfloat16 if amp_name == "bf16" else torch.float16
-    if device.type == "cuda" and amp_dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+    # xformers runs its attention in bfloat16 only from compute capability 8.0, the RTX 30xx
+    # generation. `torch.cuda.is_bf16_supported` is more generous than that and says yes on a
+    # Turing card, where the forward pass then dies inside xformers, so ask the card itself.
+    if device.type == "cuda" and amp_dtype is torch.bfloat16 and torch.cuda.get_device_capability(device)[0] < 8:
+        name = torch.cuda.get_device_name(device)
+        major, minor = torch.cuda.get_device_capability(device)
         raise RuntimeError(
-            "this GPU has no bfloat16, so the E-RayZer forward pass cannot run here. "
-            "Reconstruct on the cluster and start the viewer with --scene <file>, or use --scene synthetic."
+            f"{name} has compute capability {major}.{minor}, and E-RayZer needs 8.0 for its bfloat16 attention, "
+            "so the forward pass cannot run here. Reconstruct on the cluster and start the viewer with "
+            "--scene <file>, or use --scene synthetic."
         )
     if not (config.training.get("use_amp", True) and device.type == "cuda"):
         amp_dtype = None
 
     module_name, class_name = config.model.class_name.rsplit(".", 1)
     model = importlib.import_module(module_name).__dict__[class_name](config).to(device)
-    state_dict = checkpoint.get("model", checkpoint)
-    state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
+    state_dict, dropped = model_state_dict(checkpoint)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"Loaded {entry.ckpt_path}, {len(missing)} missing and {len(unexpected)} unexpected keys", flush=True)
+    report = f"Loaded {entry.ckpt_path}, {len(state_dict)} tensors"
+    if dropped:
+        report += f", {len(dropped)} training only weights skipped"
+    if missing:
+        report += f", MISSING {len(missing)} ({', '.join(missing[:4])}...)"
+    if unexpected:
+        report += f", UNEXPECTED {len(unexpected)} ({', '.join(unexpected[:4])}...)"
+    print(report, flush=True)
     del checkpoint, state_dict
     return ModelBundle(model=model.eval(), config=config, ckpt_id=entry.id, amp_dtype=amp_dtype)
 
