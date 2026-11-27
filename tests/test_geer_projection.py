@@ -134,7 +134,9 @@ def test_training_and_evaluation_mask_the_same_pixels(camera_model, tile_mode):
     train_source = inspect.getsource(train.compute_loss)
     assert "loss_render_mask(config" in train_source
     assert train_source.count("render_mask(") == 1, "a second mask would be a second convention"
-    assert "render_mask(" not in inspect.getsource(evaluate.main)
+    main_source = inspect.getsource(evaluate.main)
+    assert "render_mask(" not in main_source
+    assert "evaluation_mask(config" in main_source, "the evaluation has to ask for that mask"
     eval_source = inspect.getsource(evaluate.evaluation_mask)
     assert "loss_render_mask(config" in eval_source
     assert "mask_override" in eval_source, "the only other mask is the one an option asks for"

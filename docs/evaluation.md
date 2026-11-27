@@ -81,6 +81,14 @@ its own config was trained with.
 | `evaluation.sample_views` | Target view indices, for example `0,2,4`, written as `panel_<view>.png` with the real image next to the rendering |
 | `evaluation.novel_views` | How many poses halfway between the input poses, moved sideways by `evaluation.novel_offset` scene radii, to render as `novel_*.png`. They have no ground truth and carry no score, they show what the model does away from its input views |
 
+The circle mask is still intersected with the range the camera model itself
+is defined on. For a UCM camera that range shrinks with a large alpha and a
+short focal length, roughly below a focal length of half the image width times
+the square root of `2 alpha - 1`, and such a view would be scored on fewer
+pixels than the models it is compared against. At the values the b90 runs
+learned the circle survives untouched; when it does not, the job log says so
+and names the share of the circle that is missing.
+
 `metrics.txt` and `summary.csv` report `psnr` and `ssim` on the active mask,
 `psnr_unmasked` and `ssim_unmasked` on the whole frame, and `mask_fraction`,
 the share of pixels the mask covers. SSIM is the usual one, an 11 by 11

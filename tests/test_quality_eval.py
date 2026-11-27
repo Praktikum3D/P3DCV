@@ -178,6 +178,49 @@ def test_the_circle_override_scores_every_model_on_the_same_pixels():
     assert disc.mean().item() == pytest.approx(math.pi / 4, abs=0.002)
 
 
+def test_a_healthy_camera_covers_the_whole_image_circle():
+    """At the values the b90 runs learned no model loses a single pixel of the circle."""
+    for camera_model in ["pinhole", "fisheye", "ucm"]:
+        config = eval_config(camera_model, mask_override="circle")
+        fxfycxcy = intrinsics(camera_model)
+        mask = evaluate.evaluation_mask(config, fxfycxcy, H, W)
+        shortfall = evaluate.circle_mask_shortfall(mask, fxfycxcy, H, W)
+        assert shortfall.max().item() == 0.0, camera_model
+
+
+def test_a_collapsed_ucm_camera_announces_its_smaller_mask(capsys):
+    """A large alpha with a short focal length shrinks the UCM validity range inside the circle.
+
+    The comparison is only fair while every model is scored on the same pixels, so this case has to
+    be visible in the job log instead of quietly producing a better looking number.
+    """
+    evaluate._CIRCLE_SHORTFALL_REPORTED = False
+    config = eval_config("ucm", mask_override="circle")
+    fxfycxcy = intrinsics("ucm", f=60.0, alpha=0.8)
+    mask = evaluate.evaluation_mask(config, fxfycxcy, H, W)
+    shortfall = evaluate.circle_mask_shortfall(mask, fxfycxcy, H, W)
+    assert mask.mean().item() == pytest.approx(0.287, abs=0.005)
+    assert shortfall.max().item() == pytest.approx(1.0 - 0.287 / (math.pi / 4), abs=0.01)
+    printed = capsys.readouterr().out
+    assert "does not cover the whole image circle" in printed
+    assert "ucm" in printed
+    # the borderline the shortfall follows, f = w / 2 times the square root of 2 alpha - 1
+    border = (W / 2) * math.sqrt(2 * 0.8 - 1)
+    wide = intrinsics("ucm", f=border * 1.05, alpha=0.8)
+    assert evaluate.circle_mask_shortfall(
+        evaluate.evaluation_mask(config, wide, H, W), wide, H, W
+    ).max().item() == 0.0
+
+
+def test_the_warning_about_a_smaller_mask_is_printed_once(capsys):
+    evaluate._CIRCLE_SHORTFALL_REPORTED = False
+    config = eval_config("ucm", mask_override="circle")
+    fxfycxcy = intrinsics("ucm", f=60.0, alpha=0.8)
+    for _ in range(3):
+        evaluate.evaluation_mask(config, fxfycxcy, H, W)
+    assert capsys.readouterr().out.count("does not cover the whole image circle") == 1
+
+
 def test_the_circle_is_wider_than_the_mask_a_wide_angle_model_was_trained_with():
     """Guard against the override quietly doing nothing: it has to add the ring beyond 90 degrees.
 
@@ -413,6 +456,21 @@ def test_the_lateral_offset_is_a_share_of_the_scene_radius():
         right = straight[index, :3, 0].double()
         assert torch.dot(step / step.norm(), right).item() == pytest.approx(1.0 if index % 2 == 0 else -1.0, abs=1e-5)
     assert torch.allclose(straight[:, :3, :3], shifted[:, :3, :3])
+
+
+@pytest.mark.parametrize("num_input", [2, 3, 5, 10])
+@pytest.mark.parametrize("count", [1, 2, 3, 5])
+def test_no_two_novel_poses_are_the_same(num_input, count):
+    """Two input views and three poses used to put the first and the third in the same place."""
+    poses = input_poses(count=num_input)
+    novel = evaluate.novel_pose_c2ws(poses, count=count, lateral_offset=0.3)
+    assert novel.shape == (count, 4, 4)
+    centres = {tuple(round(value, 6) for value in pose[:3, 3].tolist()) for pose in novel}
+    assert len(centres) == count
+    # and none of them is an input pose, with or without the shift
+    straight = evaluate.novel_pose_c2ws(poses, count=count, lateral_offset=0.0)
+    for pose in straight:
+        assert (poses[:, :3, 3] - pose[:3, 3]).norm(dim=1).min().item() > 1e-3
 
 
 def test_a_single_input_pose_still_gives_poses():

@@ -184,6 +184,37 @@ def evaluation_section(config: edict) -> edict:
     return section if isinstance(section, dict) else edict()
 
 
+def image_circle_disc(fxfycxcy: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    """The circle spanning the image width around the principal point, [n, 1, h, w].
+
+    This is the mask the cross model comparison wants every model to be scored on, independent of
+    any camera model, and the reference circle_mask_shortfall measures against.
+    """
+    y, x = torch.meshgrid(
+        torch.arange(h, device=fxfycxcy.device), torch.arange(w, device=fxfycxcy.device), indexing="ij"
+    )
+    dx = x + 0.5 - fxfycxcy[:, 2, None, None]
+    dy = y + 0.5 - fxfycxcy[:, 3, None, None]
+    return (torch.sqrt(dx**2 + dy**2) <= w / 2).float()[:, None]
+
+
+def circle_mask_shortfall(mask: torch.Tensor, fxfycxcy: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    """Share of the image circle a view does not score, [n], zero when it scores the whole circle.
+
+    render_mask intersects the circle with the validity range of the camera model, and for UCM that
+    range shrinks with a large alpha and a short focal length: a view needs roughly f >= w / 2 times
+    the square root of 2 alpha - 1 to keep the whole circle. At the focal length and alpha the b90
+    runs learned the circle survives untouched, but a collapsed camera would quietly be scored on
+    fewer pixels than the models it is compared against, which is not a comparison any more.
+    """
+    disc = image_circle_disc(fxfycxcy, h, w)
+    missing = (disc * (1.0 - mask.clamp(0, 1))).flatten(1).sum(1)
+    return missing / disc.flatten(1).sum(1).clamp_min(1.0)
+
+
+_CIRCLE_SHORTFALL_REPORTED = False
+
+
 def evaluation_mask(config: edict, fxfycxcy: torch.Tensor, h: int, w: int):
     """Pixels the evaluation scores, [n, 1, h, w], or None for the whole image.
 
@@ -191,8 +222,10 @@ def evaluation_mask(config: edict, fxfycxcy: torch.Tensor, h: int, w: int):
     otherwise loss_render_mask, the very mask the training loss used, so a model is scored on the
     pixels it was trained on. With evaluation.mask_override "circle" every model, pinhole included,
     is scored on the circle spanning the image width without the 90 degree cap, which is what makes
-    numbers from a pinhole model and from a 195 degree fisheye model comparable at all.
+    numbers from a pinhole model and from a 195 degree fisheye model comparable at all. A camera
+    whose own validity range no longer covers that circle is reported once, see circle_mask_shortfall.
     """
+    global _CIRCLE_SHORTFALL_REPORTED
     override = evaluation_section(config).get("mask_override", None)
     override = "" if override is None else str(override).strip().lower()
     camera_model = config.model.get("camera_model", "pinhole")
@@ -201,7 +234,18 @@ def evaluation_mask(config: edict, fxfycxcy: torch.Tensor, h: int, w: int):
             return None
         return loss_render_mask(config, fxfycxcy, h, w)
     if override == "circle":
-        return render_mask(fxfycxcy, h, w, camera_model, image_circle=True, exact=True)
+        mask = render_mask(fxfycxcy, h, w, camera_model, image_circle=True, exact=True)
+        shortfall = circle_mask_shortfall(mask, fxfycxcy, h, w)
+        worst = float(shortfall.max().detach().cpu().item()) if shortfall.numel() else 0.0
+        if worst > 0.0 and not _CIRCLE_SHORTFALL_REPORTED:
+            _CIRCLE_SHORTFALL_REPORTED = True
+            affected = int((shortfall > 0).sum().detach().cpu().item())
+            print(
+                f"WARNING: the {camera_model} camera does not cover the whole image circle, "
+                f"{affected} of {shortfall.numel()} views miss up to {worst * 100:.1f} percent of it. "
+                "These numbers are scored on fewer pixels than the other models in the comparison."
+            )
+        return mask
     raise ValueError(f"Unknown evaluation.mask_override: {override!r}, use unset or circle")
 
 
@@ -251,12 +295,15 @@ def parse_view_indices(value: Any) -> list[int]:
 def novel_pose_c2ws(c2w_input: torch.Tensor, count: int = 3, lateral_offset: float = 0.3) -> torch.Tensor:
     """`count` camera to world poses that no input view had, [count, 4, 4].
 
-    Each one sits halfway between two neighbouring input poses, rotation by quaternion slerp and
-    centre on the straight line, and is then moved sideways along its own right axis by
-    lateral_offset times the scene radius, the largest distance of an input camera centre from their
-    mean. Halfway and not on a grid of fractions on purpose: a fraction of zero or one would hand
-    back an input pose, and the point of these renders is that no input view ever saw them. They
-    have no ground truth, they only show what the model does away from its inputs.
+    The poses are spread evenly over the chain of input poses, rotation by quaternion slerp and
+    centre on the straight line between two neighbours, and each is then moved sideways along its
+    own right axis by lateral_offset times the scene radius, the largest distance of an input camera
+    centre from their mean. The fraction along a segment stays between a quarter and three quarters,
+    so a pose is never one of the inputs again, and two of them are never the same pose either: with
+    two input views and three poses the old halfway rule put the first and the third in the same
+    place. Only a single input pose leaves nothing to interpolate, and then they differ by the side
+    of the shift alone. These renders have no ground truth, they only show what the model does away
+    from its inputs.
     """
     poses = c2w_input.detach().to(torch.float64).cpu().numpy()
     centres = poses[:, :3, 3]
@@ -268,9 +315,10 @@ def novel_pose_c2ws(c2w_input: torch.Tensor, count: int = 3, lateral_offset: flo
     for step in range(count):
         if num_input < 2:
             index, fraction = 0, 0.0
-        else:  # the segments are spread over the whole chain of input poses
-            index = min(int(step * (num_input - 1) / max(count, 1)), num_input - 2)
-            fraction = 0.5
+        else:  # evenly over the chain of input poses, pulled away from both of its ends
+            position = (step + 0.5) * (num_input - 1) / max(count, 1)
+            index = min(int(np.floor(position)), num_input - 2)
+            fraction = 0.25 + 0.5 * float(position - index)
         quat_a = camera_utils.quaternion_from_matrix(poses[index][:3, :3])
         quat_b = camera_utils.quaternion_from_matrix(poses[min(index + 1, num_input - 1)][:3, :3])
         rotation = camera_utils.quaternion_matrix(camera_utils.quaternion_slerp(quat_a, quat_b, fraction))[:3, :3]
