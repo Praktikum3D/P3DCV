@@ -78,6 +78,12 @@ print('testing gsplat:', gsplat.__file__)
 "
 
 echo "== 3/3 pytest tests/gsplat_kb"
+# The image has no pytest. Install it into a separate folder (no deps, so the
+# image's packages are not shadowed; pytest 7.4 works with the image's pluggy 1.0).
+if ! python -c "import pytest" 2>/dev/null; then
+    pip install --no-deps --target "$OUT_DIR/pytest-site" pytest==7.4.4 iniconfig
+    export PYTHONPATH="$OUT_DIR/pytest-site${PYTHONPATH:+:$PYTHONPATH}"
+fi
 set +e
 python -m pytest tests/gsplat_kb -v -rs -p no:cacheprovider 2>&1 | tee "$OUT_DIR/pytest.log"
 STATUS=${PIPESTATUS[0]}

@@ -55,4 +55,5 @@ def test_unchanged(reference, config):
         noise = float((new[key] - again[key]).abs().max())
         stats[key] = dict(rel_diff=diff / max(scale, 1e-12), rel_run_to_run=noise / max(scale, 1e-12))
         assert diff <= max(1e-5 * scale, 4 * noise), (name, key, diff, noise, scale)
-    report(f"regression[{name}]", dict(forward_identical=True, **{k: v["rel_diff"] for k, v in stats.items()}))
+    report(f"regression[{name}]", dict(forward_identical=True, **{f"{k}_{m}": x for k, v in stats.items()
+                                                                  for m, x in v.items()}))

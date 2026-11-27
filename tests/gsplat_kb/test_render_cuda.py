@@ -2,6 +2,22 @@
 
 3. dL/d(fx, fy, cx, cy, k1..k4) from rasterization() against central finite
    differences of the full render, L = sum(render * W).
+
+   gsplat's rasterizer is only piecewise smooth: a Gaussian stops contributing
+   where its alpha drops below 1/255 (and outside its 3-sigma tiles), so the
+   render jumps where pixels cross that contour. The analytic gradient ignores
+   these jumps, central differences do not. Hence:
+   * W is a smooth pattern. With per-pixel white noise the jumps add up like a
+     random walk instead of cancelling, and FD does not converge as h -> 0
+     (measured: FD of cx ranged over -0.5 .. 12.9 for h = 0.0025 .. 0.04 px;
+     the unmodified fork's pinhole path fails the same check by up to 109 %).
+   * The cx / cy step is 0.3 px. They only translate the image, so FD is flat
+     in h there (0.1 .. 1 px agree to ~1 %), while tiny steps flip few pixels
+     and are noisy. f and k keep small steps: their FD curves beyond ~10x.
+   * Expect FD to exceed the analytic value by ~2.5-4 %: the dropped contour
+     term is about ln(255 o) / (255 o) of the response for opacity o (2.4 %
+     at o = 0.9, 3.8 % at o = 0.5). The pinhole path of the unmodified fork
+     shows the same bias (fx, fy: 3.6-3.8 %).
 6. Recovery: render with known KB parameters, perturb them, optimise only the
    camera parameters on the photometric loss and check that they come back.
 10. The renderer and the Plücker map agree: tiny Gaussians placed along the
@@ -67,8 +83,11 @@ FD_CASES = [
 @pytest.mark.parametrize("name,cam,packed,mode", FD_CASES, ids=[c[0] for c in FD_CASES])
 def test_finite_differences(name, cam, packed, mode):
     scene = make_scene(cam, N=4000, theta_max=cam.get("theta_max"))
-    g = torch.Generator().manual_seed(1)
-    Wt = torch.randn(cam["height"], cam["width"], 3, generator=g, dtype=torch.float64).to(DEV)
+    # smooth weights (see the module docstring), a different phase per channel
+    yy, xx = torch.meshgrid(torch.arange(cam["height"], dtype=torch.float64),
+                            torch.arange(cam["width"], dtype=torch.float64), indexing="ij")
+    Wt = torch.stack([torch.sin(2 * math.pi * (1.3 * xx / cam["width"] + 0.7 * yy / cam["height"]) + ph)
+                      for ph in (0.0, 1.0, 2.0)], -1).to(DEV)
     intr0 = torch.tensor([cam["f"], cam["f"] * 1.01, cam["c"], cam["c"] - 2.0], device=DEV)
     k0 = torch.tensor(cam["k"], device=DEV)
 
@@ -80,7 +99,7 @@ def test_finite_differences(name, cam, packed, mode):
     loss(intr, k).backward()
     analytic = torch.cat([intr.grad, k.grad]).double().cpu()
 
-    steps = [1e-3 * cam["f"], 1e-3 * cam["f"], 1e-2, 1e-2, 1e-4, 1e-4, 1e-4, 1e-4]
+    steps = [1e-3 * cam["f"], 1e-3 * cam["f"], 0.3, 0.3, 1e-4, 1e-4, 1e-4, 1e-4]
     fd = []
     with torch.no_grad():
         for i, h in enumerate(steps):

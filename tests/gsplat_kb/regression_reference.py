@@ -61,7 +61,8 @@ def compute(config):
         t["means"], t["quats"], t["scales"], t["opacities"], t["sh"], t["viewmats"], t["Ks"], W, H,
         sh_degree=1, packed=packed, rasterize_mode=rasterize_mode, render_mode=render_mode,
         camera_model=camera_model, near_plane=0.2,
-        backgrounds=torch.ones(2, 4 if render_mode != "RGB" else 3, device="cuda") * 0.5,
+        # [C, 3]: for "RGB+D" / "RGB+ED" gsplat appends the zero depth background itself.
+        backgrounds=torch.ones(2, 3, device="cuda") * 0.5,
     )
     D = render.shape[-1]
     L = (render * weights[..., :D]).sum() + (alphas[..., 0] * weights[..., 0]).sum()
