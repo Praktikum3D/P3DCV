@@ -186,7 +186,8 @@ def main() -> None:
                 b, v, c, h, w = pred.shape
                 fxfycxcy = result.fxfycxcy_target.float().reshape(b * v, -1)
                 circle = "fish" in str(config.dataset.get("camera_name", ""))
-                mask = render_mask(fxfycxcy, h, w, camera_model, circle).reshape(b, v, 1, h, w)
+                exact = config.model.get("renderer", "gsplat") == "geer"
+                mask = render_mask(fxfycxcy, h, w, camera_model, circle, exact).reshape(b, v, 1, h, w)
                 mse_per_image = ((pred - target).pow(2) * mask).flatten(2).sum(2) / (mask.flatten(2).sum(2) * c).clamp_min(1.0)
             else:
                 mse_per_image = (pred - target).pow(2).flatten(2).mean(dim=2)

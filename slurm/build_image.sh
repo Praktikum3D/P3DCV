@@ -11,9 +11,12 @@
 set -euo pipefail
 source "${REPO_DIR:-/mnt/home/$USER/code/P3DCV}/slurm/common.sh"
 
-TAG=p3dcv
+# IMAGE sets the output file, GSPLAT_REPO and GSPLAT_REF another gsplat (see docker/Dockerfile).
+TAG="p3dcv-$(basename "$IMAGE" .sqsh)"
 
-podman build -t "$TAG" -f "$REPO_DIR/docker/Dockerfile" "$REPO_DIR/docker"
+podman build -t "$TAG" ${GSPLAT_REPO:+--build-arg GSPLAT_REPO="$GSPLAT_REPO"} \
+    ${GSPLAT_REF:+--build-arg GSPLAT_REF="$GSPLAT_REF"} \
+    -f "$REPO_DIR/docker/Dockerfile" "$REPO_DIR/docker"
 
 # Write next to the final location and rename at the end, so running jobs
 # never see a partial image. The image is too large for /tmp.

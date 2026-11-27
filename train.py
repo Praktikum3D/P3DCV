@@ -259,7 +259,8 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
         # Only pixels the camera can render count, for fisheye data only inside the image circle.
         b, v, _, h, w = pred.shape
         fxfycxcy = result.fxfycxcy_target.detach().float().reshape(b * v, -1)
-        mask = render_mask(fxfycxcy, h, w, camera_model, "fish" in str(config.dataset.get("camera_name", "")))
+        mask = render_mask(fxfycxcy, h, w, camera_model, "fish" in str(config.dataset.get("camera_name", "")),
+                           exact=config.model.get("renderer", "gsplat") == "geer")
         mask = mask.reshape(b, v, 1, h, w).to(pred.dtype)
         pred, inside = pred * mask + target * (1 - mask), max(mask.mean().item(), 1e-3)
     mse = F.mse_loss(pred, target) / inside
@@ -341,11 +342,12 @@ def init_wandb(config: edict, rank: int):
 def camera_stats(result: edict, camera_model: str) -> Dict[str, float]:
     """Mean predicted focal length (normalized by image width) and the FOV across the image width."""
     fx = result.fxfycxcy[:, 0].detach().float()
-    fov = 2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), camera_model)
-    return {
-        "camera/fx_norm": fx.mean().item(),
-        "camera/fov_deg": math.degrees(fov.mean().item()),
-    }
+    alpha = result.fxfycxcy[:, 4].detach().float() if camera_model == "ucm" else None
+    fov = 2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), camera_model, alpha)
+    stats = {"camera/fx_norm": fx.mean().item(), "camera/fov_deg": math.degrees(fov.mean().item())}
+    if alpha is not None:
+        stats["camera/alpha"] = alpha.mean().item()
+    return stats
 
 
 def render_grid(result: edict) -> np.ndarray:
