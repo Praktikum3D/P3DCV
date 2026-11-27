@@ -31,6 +31,10 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
 MAX_STEPS="${MAX_STEPS:-20000}"
 LR="${LR:-0.0001}"
 WARMUP="${WARMUP:-500}"
+# Learning rate of the camera heads (focal length and UCM alpha) as a factor of LR, decaying to zero
+# over CAMERA_LR_DECAY_STEPS forward/backward steps (same unit as MAX_STEPS, 0 turns the decay off).
+CAMERA_LR_SCALE="${CAMERA_LR_SCALE:-1.0}"
+CAMERA_LR_DECAY_STEPS="${CAMERA_LR_DECAY_STEPS:-0}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-1000}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 # Weights & Biases logging. Set WANDB_PROJECT= (empty) to turn it off.
@@ -90,6 +94,8 @@ EXTRA_ARGS=(
     -s training.max_fwdbwd_passes "$MAX_STEPS"
     -s training.lr "$LR"
     -s training.warmup "$WARMUP"
+    -s training.camera_lr_scale "$CAMERA_LR_SCALE"
+    -s training.camera_lr_decay_steps "$CAMERA_LR_DECAY_STEPS"
     -s training.checkpoint_every "$CHECKPOINT_EVERY"
     -s training.num_workers "$NUM_WORKERS"
     -s training.perceptual_loss_weight_path "$PRETRAINED_DIR/imagenet-vgg-verydeep-19.mat"
