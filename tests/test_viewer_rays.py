@@ -32,6 +32,7 @@ from viewer.camera import (
     project_points,
     theta_max,
 )
+from viewer.scene import list_checkpoints, load_scene, make_synthetic_scene, save_scene
 
 H, W = 24, 32
 MODELS = [("pinhole", None), ("fisheye", None), ("ucm", 0.2), ("ucm", 0.7)]
@@ -197,3 +198,160 @@ def test_estimated_camera_info_reports_the_training_formula():
 
     ucm = torch.tensor([[0.5, 0.5, 0.5, 0.5, 0.62]], dtype=torch.float32)
     assert abs(estimated_camera_info(ucm, "ucm")[0]["alpha"] - 0.62) < 1e-6
+
+
+# ------------------------------------------------------------------------------------------------
+# checkpoints and scenes
+# ------------------------------------------------------------------------------------------------
+
+
+def write_run(root, name, files, camera_model=None):
+    import yaml
+
+    run = os.path.join(root, "runs", name)
+    os.makedirs(run, exist_ok=True)
+    for file_name in files:
+        open(os.path.join(run, file_name), "wb").close()
+    if camera_model is not None:
+        config = {"model": {"camera_model": camera_model, "renderer": "geer", "geer_tile_mode": "projection"}}
+        with open(os.path.join(run, "config.yaml"), "w", encoding="utf-8") as handle:
+            yaml.safe_dump(config, handle)
+    return run
+
+
+def test_checkpoint_discovery_picks_the_newest_and_reads_the_camera(tmp_path):
+    """`last.pt` wins, otherwise the highest step, a run without a checkpoint is skipped."""
+    root = str(tmp_path)
+    write_run(root, "a", [f"ckpt_{1000:016d}.pt", f"ckpt_{2000:016d}.pt", "last.pt"], "ucm")
+    write_run(root, "b", [f"ckpt_{9:016d}.pt", f"ckpt_{30000:016d}.pt"], "fisheye")
+    write_run(root, "c", [])
+    write_run(root, "d", ["last.pt"])  # no config.yaml at all
+    pretrained = os.path.join(root, "erayzer_multi.pt")
+    open(pretrained, "wb").close()
+
+    entries = {entry.id: entry for entry in list_checkpoints(pretrained, os.path.join(root, "runs"))}
+    assert set(entries) == {"pretrained", "runs/a", "runs/b", "runs/d"}  # c has no checkpoint
+    assert entries["runs/a"].ckpt_path.endswith("last.pt")
+    assert entries["runs/b"].ckpt_path.endswith(f"ckpt_{30000:016d}.pt")
+    assert entries["runs/a"].camera_settings["camera_model"] == "ucm"
+    assert entries["runs/b"].camera_settings["camera_model"] == "fisheye"
+    assert "ucm" in entries["runs/a"].label and "projection" in entries["runs/a"].label
+    # Without a config the entry survives, says so, and falls back to the training defaults.
+    assert entries["runs/d"].warning
+    assert entries["runs/d"].camera_settings["camera_model"] == "pinhole"
+    assert list_checkpoints(None, None) == []
+
+
+def test_synthetic_scene_uses_raw_gaussian_values():
+    """`set_data` takes raw values, so the activations have to land in the intended ranges."""
+    scene = make_synthetic_scene(torch.device("cpu"))
+    assert 15000 < scene.num_gaussians < 25000
+    pc = scene.pc
+    assert pc.get_xyz.shape == (scene.num_gaussians, 3)
+    assert pc.get_features.shape == (scene.num_gaussians, 1, 3)  # sh_degree 0
+    assert pc._rotation.shape == (scene.num_gaussians, 4)
+    assert pc.get_xyz.dtype == torch.float32
+
+    scaling = pc.get_scaling
+    assert float(scaling.min()) > 0.01 and float(scaling.max()) < 0.2
+    opacity = pc.get_opacity
+    assert 0.8 < float(opacity.min()) <= float(opacity.max()) < 1.0
+    assert torch.allclose(pc.get_rotation.norm(dim=-1), torch.ones(scene.num_gaussians), atol=1e-6)
+
+    assert scene.c2w_input.shape == (5, 4, 4)
+    assert scene.fxfycxcy_input.shape == (5, 4)
+    # The stand in cameras look at the origin from a circle around it.
+    forward = scene.c2w_input[:, :3, 2]
+    position = scene.c2w_input[:, :3, 3]
+    assert torch.allclose(forward, -position / position.norm(dim=-1, keepdim=True), atol=1e-5)
+    determinant = torch.linalg.det(scene.c2w_input[:, :3, :3])
+    assert torch.allclose(determinant, torch.ones(5), atol=1e-5)  # a rotation, not a mirror
+
+
+def test_scene_survives_a_round_trip_through_a_file(tmp_path):
+    """A scene written on the cluster has to come back identical on the development GPU."""
+    scene = make_synthetic_scene(torch.device("cpu"))
+    path = save_scene(scene, str(tmp_path / "scene.pt"))
+    back = load_scene(path, torch.device("cpu"))
+    assert back.num_gaussians == scene.num_gaussians
+    assert back.sh_degree == scene.sh_degree
+    assert back.camera_model == scene.camera_model
+    assert back.tile_mode == scene.tile_mode
+    assert back.input_hw == scene.input_hw
+    assert torch.equal(back.pc.get_xyz, scene.pc.get_xyz)
+    assert torch.equal(back.pc.get_features, scene.pc.get_features)
+    assert torch.equal(back.pc.get_opacity, scene.pc.get_opacity)
+    assert torch.equal(back.c2w_input, scene.c2w_input)
+
+
+# ------------------------------------------------------------------------------------------------
+# rendering, needs the gsplat-geer build on a GPU
+# ------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="3DGEER needs a GPU")
+class TestRendering:
+    @staticmethod
+    def scene():
+        return make_synthetic_scene(torch.device("cuda"))
+
+    @pytest.mark.parametrize("camera_model, alpha", [("pinhole", None), ("fisheye", None), ("ucm", 0.7)])
+    @pytest.mark.parametrize("tile_mode", ["projection", "pbf"])
+    def test_every_camera_model_renders(self, camera_model, alpha, tile_mode):
+        from viewer.render import render_view
+
+        scene = self.scene()
+        fov = {"pinhole": 90.0, "fisheye": 195.0, "ucm": 160.0}[camera_model]
+        c2w = torch.eye(4, device="cuda")
+        image, info = render_view(scene, c2w, camera_model, fov, alpha, 128, 128, tile_mode=tile_mode,
+                                  frusta=False)
+        assert image.shape == (128, 128, 3) and image.dtype == np.uint8
+        assert int(image.min()) < int(image.max())  # something was drawn, not one flat colour
+        assert abs(info["fov_used"] - fov) < 1e-6
+
+    def test_ucm_blacks_out_everything_past_its_image_circle(self):
+        from viewer.render import render_view
+
+        scene = self.scene()
+        alpha, fov = 0.7, 160.0
+        image, _ = render_view(scene, torch.eye(4, device="cuda"), "ucm", fov, alpha, 128, 128, frusta=False)
+        fxfycxcy, _ = fov_to_fxfycxcy("ucm", fov, alpha, 128, 128)
+        _, _, _, _, valid = pixel_angles(fxfycxcy, 128, 128, "ucm", exact=True)
+        outside = ~valid[0].numpy()
+        assert outside.any()  # the corners of a square UCM image really do fall outside
+        assert image[outside].max() == 0
+        assert image[valid[0].numpy()].max() > 0
+
+    def test_alpha_view_stays_between_zero_and_one(self):
+        from viewer.render import render_view
+
+        scene = self.scene()
+        image, _ = render_view(scene, torch.eye(4, device="cuda"), "fisheye", 195.0, None, 128, 128,
+                               view="alpha", frusta=False)
+        assert image.min() >= 0 and image.max() <= 255
+        assert image.max() > 200  # the scene surrounds the camera, so some pixels are fully covered
+
+    def test_projection_renders_past_ninety_degrees_and_pbf_does_not(self):
+        """The ring of columns is only visible beyond 90 degrees in the projection tile mode.
+
+        3DGEER in its pbf mode bounds the Gaussians in tangent space and drops everything behind the
+        camera plane, so the part of a 195 degree image past 90 degrees stays background.
+        """
+        from viewer.render import render_view
+
+        scene = self.scene()
+        size, fov = 256, 195.0
+        c2w = torch.eye(4, device="cuda")
+        fxfycxcy, _ = fov_to_fxfycxcy("fisheye", fov, None, size, size)
+        _, _, radius, theta, _ = pixel_angles(fxfycxcy, size, size, "fisheye", exact=True)
+        beyond = (theta[0] > math.pi / 2).numpy()  # the corners, more than 90 degrees off axis
+        assert beyond.sum() > 500
+
+        painted = {}
+        for tile_mode in ("projection", "pbf"):
+            image, _ = render_view(scene, c2w, "fisheye", fov, None, size, size, tile_mode=tile_mode,
+                                   frusta=False)
+            # The background is white, so anything else is scene content.
+            painted[tile_mode] = float((image[beyond].min(axis=-1) < 240).mean())
+        assert painted["projection"] > 0.2
+        assert painted["pbf"] < 0.01
