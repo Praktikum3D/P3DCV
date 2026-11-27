@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import erayzer_core  # noqa: F401  # registers model.* and utils.* aliases
 from erayzer_core.losses import PerceptualLoss
-from erayzer_core.model.utils_gaussian import camera_theta, loss_render_mask
+from erayzer_core.model.utils_gaussian import UCM_MODELS, camera_theta, loss_render_mask
 from training.camera_augmentation import MODEL_CODES
 from training.datasets import build_dataset as build_config_dataset
 
@@ -161,10 +161,11 @@ def build_dataloader(config: edict, rank: int, world_size: int) -> Tuple[torch.u
     return dataset, dataloader
 
 
-# The camera heads of the model: canonical_k_head predicts the focal length, alpha_head the UCM alpha
-# (the latter only exists for model.camera_model == ucm). Matching the names as substrings keeps the
-# partition working through the module. prefix of DDP and the pose_predictor. prefix of PoseEstimator.
-CAMERA_HEAD_NAMES = ("canonical_k_head", "alpha_head")
+# The camera heads of the model: canonical_k_head predicts the focal length, alpha_head the (E)UCM
+# alpha and beta_head the EUCM beta (alpha_head only exists for model.camera_model in UCM_MODELS,
+# beta_head only for eucm). Matching the names as substrings keeps the partition working through the
+# module. prefix of DDP and the pose_predictor. prefix of PoseEstimator.
+CAMERA_HEAD_NAMES = ("canonical_k_head", "alpha_head", "beta_head")
 
 
 def is_camera_parameter(name: str) -> bool:
@@ -420,11 +421,14 @@ def init_wandb(config: edict, rank: int):
 def camera_stats(result: edict, camera_model: str) -> Dict[str, float]:
     """Mean predicted focal length (normalized by image width) and the FOV across the image width."""
     fx = result.fxfycxcy[:, 0].detach().float()
-    alpha = result.fxfycxcy[:, 4].detach().float() if camera_model == "ucm" else None
-    fov = 2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), camera_model, alpha)
+    alpha = result.fxfycxcy[:, 4].detach().float() if camera_model in UCM_MODELS else None
+    beta = result.fxfycxcy[:, 5].detach().float() if camera_model == "eucm" else None
+    fov = 2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), camera_model, alpha, beta)
     stats = {"camera/fx_norm": fx.mean().item(), "camera/fov_deg": math.degrees(fov.mean().item())}
     if alpha is not None:
         stats["camera/alpha"] = alpha.mean().item()
+    if beta is not None:
+        stats["camera/beta"] = beta.mean().item()
     return stats
 
 
@@ -445,14 +449,17 @@ def aug_stats(
     # end up as Python floats anyway, and a few scalars per batch cost nothing.
     fov_true = batch["aug_fov_true"].detach().float().flatten().cpu()           # [b]
     b = fov_true.shape[0]
-    # [b*v_all, 4 or 5] back to [b, v_all, .]. The views padded up to ten repeat the last image, so
+    # [b*v_all, 4, 5 or 6] back to [b, v_all, .]. The views padded up to ten repeat the last image, so
     # their predictions belong to the same drawn camera and averaging over all of them is right.
     fxfycxcy = result.fxfycxcy.detach().float().reshape(b, -1, result.fxfycxcy.shape[-1])
     fx = fxfycxcy[..., 0].mean(dim=1)                                           # [b], mean over views
-    has_alpha = camera_model == "ucm" and fxfycxcy.shape[-1] > 4
-    alpha = fxfycxcy[..., 4].mean(dim=1) if has_alpha else None
-    model_for_fov = camera_model if has_alpha or camera_model != "ucm" else "pinhole"
-    fov_pred = torch.rad2deg(2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), model_for_fov, alpha))
+    # Without its extra intrinsics there is no (E)UCM camera to speak of, so the FOV falls back to the
+    # pinhole one instead of asking camera_theta for an alpha and a beta that are not in the vector.
+    usable = fxfycxcy.shape[-1] >= {"ucm": 5, "eucm": 6}.get(camera_model, 4)
+    alpha = fxfycxcy[..., 4].mean(dim=1) if usable and camera_model in UCM_MODELS else None
+    beta = fxfycxcy[..., 5].mean(dim=1) if usable and camera_model == "eucm" else None
+    model_for_fov = camera_model if usable else "pinhole"
+    fov_pred = torch.rad2deg(2.0 * camera_theta(0.5 / fx.clamp_min(1e-6), model_for_fov, alpha, beta))
     fov_err = (fov_pred.cpu() - fov_true).abs()
 
     stats = {"aug/fov_err_deg": fov_err.mean().item()}

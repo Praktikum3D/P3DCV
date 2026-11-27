@@ -42,8 +42,10 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 WANDB_PROJECT="${WANDB_PROJECT-p3dcv}"
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-/mnt/home/$USER/.secrets/wandb.env}"
 VIS_EVERY="${VIS_EVERY:-500}"
-# Camera model for rays and rendering: pinhole, fisheye (equidistant) or ucm (unified camera model with a
-# learned alpha per scene, starting at ALPHA_INIT; 0.62 matches the TartanAir fisheye).
+# Camera model for rays and rendering: pinhole, fisheye (equidistant), ucm (unified camera model with a
+# learned alpha per scene, starting at ALPHA_INIT; 0.62 matches the TartanAir fisheye) or eucm (the
+# enhanced unified camera model, alpha plus a second shape parameter beta; beta stays pinned at 1,
+# where eucm is exactly ucm, unless LEARN_BETA is set).
 # The fisheye F_SCALE turns the focal length of erayzer_multi.pt on TartanAir (about 1.1) into
 # px per radian near 195 degrees (0.29).
 CAMERA_MODEL="${CAMERA_MODEL:-pinhole}"
@@ -117,6 +119,13 @@ EXTRA_ARGS=(
 if [[ -n "${CAMERA_AUG:-}" ]]; then
     EXTRA_ARGS=(
         -s dataset.camera_augmentation true
+        "${EXTRA_ARGS[@]}"
+    )
+fi
+# LEARN_BETA=1 lets CAMERA_MODEL=eucm learn its beta. Unset keeps beta at exactly 1, which is the UCM.
+if [[ -n "${LEARN_BETA:-}" ]]; then
+    EXTRA_ARGS=(
+        -s model.learn_beta true
         "${EXTRA_ARGS[@]}"
     )
 fi
