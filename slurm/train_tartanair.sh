@@ -112,6 +112,14 @@ EXTRA_ARGS=(
     -s model.geer_tile_mode "$GEER_TILE_MODE"
     "$@"
 )
+# CAMERA_AUG=1 resamples every sample to its own randomly drawn camera (needs CAMERA=lcam_fish).
+# Unset means the dataset behaves exactly as before.
+if [[ -n "${CAMERA_AUG:-}" ]]; then
+    EXTRA_ARGS=(
+        -s dataset.camera_augmentation true
+        "${EXTRA_ARGS[@]}"
+    )
+fi
 if [[ -n "$WANDB_PROJECT" ]]; then
     EXTRA_ARGS=(
         -s training.wandb_project "$WANDB_PROJECT"

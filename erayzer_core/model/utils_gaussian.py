@@ -80,16 +80,22 @@ def render_mask(fxfycxcy, h, w, camera_model, image_circle=False, exact=False):
     return valid[:, None].float()
 
 
-def loss_render_mask(config, fxfycxcy, h, w):
+def loss_render_mask(config, fxfycxcy, h, w, has_data_mask=False):
     """The pixels the training loss and the evaluation score, [n, 1, h, w]. fxfycxcy [n, 4], UCM [n, 5].
 
     Both of them call this, so they always mask the same pixels. The mask normally stops at 90 degrees off
     axis, because neither gsplat nor 3DGEER in its "pbf" tile mode draws anything further out and those
     pixels would be background without a gradient. With the geer renderer in its "projection" tile mode the
     renderer fills the whole image circle, so the mask is the camera model's own range instead.
+
+    The image circle is a guess from the dataset name, right only as long as every frame really is a full
+    frame lcam_fish image. With camera augmentation the caller passes the sample's own data mask instead,
+    which states exactly which pixels carry data, so the guess is then dropped: keeping it would cut the
+    corners off an augmented pinhole sample, whose data mask is all ones and whose corners carry the
+    strongest focal length signal. Default False, so evaluation and every unaugmented run are unchanged.
     """
     camera_model = config.model.get("camera_model", "pinhole")
-    image_circle = "fish" in str(config.dataset.get("camera_name", ""))
+    image_circle = (not has_data_mask) and "fish" in str(config.dataset.get("camera_name", ""))
     beyond_90 = (config.model.get("renderer", "gsplat") == "geer"
                  and config.model.get("geer_tile_mode", "pbf") == "projection")
     return render_mask(fxfycxcy, h, w, camera_model, image_circle, exact=beyond_90)

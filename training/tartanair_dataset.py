@@ -14,6 +14,14 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from training.camera_augmentation import (
+    DEFAULT_SUPERSAMPLE,
+    FISH_SIZE,
+    normalize_mix,
+    remap_views,
+    sample_camera,
+)
+
 # TartanAir NED body axes (x forward, y right, z down) -> OpenCV camera axes (x right, y down, z forward).
 _R_CV_FROM_NED = np.array(
     [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
@@ -181,9 +189,26 @@ class TartanAirDataset(Dataset):
         normalize_intrinsics: bool = True,
         data_repeat: int = 1,
         is_eval: bool = False,
+        camera_augmentation: bool = False,
+        camera_aug_mix: Optional[Dict[str, float]] = None,
+        camera_aug_supersample: int = DEFAULT_SUPERSAMPLE,
     ) -> None:
         self.dataset_path = os.path.abspath(os.path.expanduser(dataset_path))
         self.camera_name = camera_name
+
+        # Camera augmentation: draw one camera per sample and resample every view of that sample to
+        # it. Only lcam_fish can feed it, because only its 195 degree equidistant projection covers
+        # every camera we want to draw. Checked before the trajectories are discovered, so a wrong
+        # camera_name fails with this message rather than with an empty dataset.
+        self.camera_augmentation = bool(camera_augmentation)
+        self.camera_aug_supersample = max(1, int(camera_aug_supersample))
+        self.camera_aug_mix = normalize_mix(camera_aug_mix) if self.camera_augmentation else None
+        if self.camera_augmentation and "fish" not in str(self.camera_name or ""):
+            raise ValueError(
+                "dataset.camera_augmentation needs a fisheye source, set dataset.camera_name to "
+                f"lcam_fish (got {self.camera_name!r})"
+            )
+
         self.trajectories = _discover_trajectories(self.dataset_path, camera_name=camera_name)
 
         self.image_size = int(image_size)
@@ -238,15 +263,31 @@ class TartanAirDataset(Dataset):
         self._pose_cache[traj_idx] = c2w
         return c2w
 
-    def _load_image_and_intrinsics(
-        self, record: _TrajectoryRecord, frame_idx: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _open_image(self, record: _TrajectoryRecord, frame_idx: int) -> Image.Image:
         entry = record.frame_entries[frame_idx]
         if record.archive_path is not None:
             raw = self._get_zip(record.archive_path).read(entry)
-            image = Image.open(io.BytesIO(raw)).convert("RGB")
-        else:
-            image = Image.open(entry).convert("RGB")
+            return Image.open(io.BytesIO(raw)).convert("RGB")
+        return Image.open(entry).convert("RGB")
+
+    def _load_native_image(self, record: _TrajectoryRecord, frame_idx: int) -> np.ndarray:
+        """One frame at its stored resolution, H x W x 3 uint8.
+
+        The camera augmentation resamples from the full 1000 x 1000 fisheye, so it must not go
+        through the resize and crop of `_load_image_and_intrinsics`.
+        """
+        array = np.asarray(self._open_image(record, frame_idx), dtype=np.uint8)
+        if array.shape[:2] != (FISH_SIZE, FISH_SIZE):
+            raise ValueError(
+                f"camera augmentation expects {FISH_SIZE} x {FISH_SIZE} lcam_fish frames, "
+                f"got {array.shape[:2]} from {record.name}"
+            )
+        return array
+
+    def _load_image_and_intrinsics(
+        self, record: _TrajectoryRecord, frame_idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        image = self._open_image(record, frame_idx)
 
         width, height = image.size
         # TartanAir-V2 pinhole (90 deg FoV): fx = fy = W/2, cx = W/2, cy = H/2.
@@ -293,6 +334,37 @@ class TartanAirDataset(Dataset):
         array = np.asarray(image, dtype=np.float32) / 255.0
         tensor = torch.from_numpy(array).permute(2, 0, 1).contiguous()
         return tensor, intr
+
+    def _augmented_views(
+        self, record: _TrajectoryRecord, indices: Sequence[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Draw one camera and resample all views of this sample to it.
+
+        One camera for the whole sample, never one per view: the views of a sample are meant to show
+        the same scene through the same lens, and the model predicts a single alpha per scene.
+
+        The draw hangs off the `random` module, which the data loader seeds per worker and per epoch,
+        so a fixed global seed reproduces the cameras exactly.
+
+        Returns the images, the per view intrinsics and the extra batch fields `data_mask`,
+        `aug_fov_true`, `aug_alpha_true` and `aug_model`.
+        """
+        rng = np.random.default_rng(random.getrandbits(63))
+        camera = sample_camera(rng, self.camera_aug_mix)
+        frames = [self._load_native_image(record, frame_idx) for frame_idx in indices]
+        images, data_mask, intr_px, alpha_true = remap_views(
+            frames, camera, self.image_size, self.camera_aug_supersample
+        )
+
+        intr = intr_px / self.image_size if self.normalize_intrinsics else intr_px
+        intrinsics = intr[None].expand(len(indices), -1).contiguous()
+        extra = {
+            "data_mask": data_mask,
+            "aug_fov_true": torch.tensor(float(camera.fov_deg), dtype=torch.float32),
+            "aug_alpha_true": torch.tensor(float(alpha_true), dtype=torch.float32),
+            "aug_model": torch.tensor(camera.code, dtype=torch.long),
+        }
+        return images, intrinsics, extra
 
     def _select_views(self, num_frames: int) -> List[int]:
         if num_frames < self.num_views:
@@ -363,23 +435,29 @@ class TartanAirDataset(Dataset):
                 continue
 
             poses = self._load_poses(traj_idx)
-            images: List[torch.Tensor] = []
-            intrinsics: List[torch.Tensor] = []
-            c2ws: List[torch.Tensor] = []
-
-            for frame_idx in indices:
-                img, intr = self._load_image_and_intrinsics(record, frame_idx)
-                images.append(img)
-                intrinsics.append(intr)
-                c2ws.append(torch.from_numpy(poses[frame_idx]).float())
-
+            c2ws = [torch.from_numpy(poses[frame_idx]).float() for frame_idx in indices]
             image_indices = torch.tensor(indices, dtype=torch.long).unsqueeze(-1)
             scene_indices = torch.full_like(image_indices, traj_idx)
+
+            extra: Dict[str, torch.Tensor] = {}
+            if self.camera_augmentation:
+                stacked_images, stacked_intr, extra = self._augmented_views(record, indices)
+            else:
+                images: List[torch.Tensor] = []
+                intrinsics: List[torch.Tensor] = []
+                for frame_idx in indices:
+                    img, intr = self._load_image_and_intrinsics(record, frame_idx)
+                    images.append(img)
+                    intrinsics.append(intr)
+                stacked_images = torch.stack(images, dim=0)
+                stacked_intr = torch.stack(intrinsics, dim=0)
+
             return {
-                "image": torch.stack(images, dim=0),
-                "fxfycxcy": torch.stack(intrinsics, dim=0),
+                "image": stacked_images,
+                "fxfycxcy": stacked_intr,
                 "c2w": torch.stack(c2ws, dim=0),
                 "index": torch.cat([image_indices, scene_indices], dim=-1),
+                **extra,
             }
 
         raise RuntimeError(
