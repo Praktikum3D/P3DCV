@@ -286,6 +286,58 @@ def test_the_renderer_passes_the_tile_mode_on_the_gpu():
 
 
 @gpu
+def test_a_ring_pixel_is_rendered_and_scored_by_the_same_mode():
+    """The point of the change, on one pixel between 90 degrees and the image circle.
+
+    The placement tests above sit outside the image circle, where no mask ever scores anything. Here
+    the Gaussian lands at 94 degrees, inside the circle, so renderer and loss mask have to agree: the
+    projection mode draws the pixel, the mask keeps it and the loss sends a gradient back through it,
+    while the pbf mode draws nothing there, the mask drops the pixel and the loss cannot tell the
+    render from plain background.
+    """
+    device = "cuda"
+    theta_deg = 94.0
+    pc = one_gaussian(device, theta_deg)
+    xyz = pc._xyz.detach().requires_grad_()
+    pc._xyz = xyz
+    C2W, fxfycxcy = fisheye_camera(device)
+    radius = GF * math.radians(theta_deg)
+    assert radius < GW / 2, "the Gaussian has to sit inside the image circle"
+    row = col = int(GH / 2 + radius / math.sqrt(2))
+
+    _, _, pixel_radius, pixel_theta, _ = pixel_angles(fxfycxcy, GH, GW, "fisheye")
+    assert pixel_theta[0, row, col].item() > math.pi / 2, "the test pixel has to be beyond 90 degrees"
+    assert pixel_radius[0, row, col].item() <= GW / 2, "and inside the image circle"
+    masks = {mode: loss_render_mask(config_of("fisheye", "geer", mode), fxfycxcy, GH, GW)
+             for mode in ["pbf", "projection"]}
+    assert masks["projection"][0, 0, row, col].item() == 1.0
+    assert masks["pbf"][0, 0, row, col].item() == 0.0
+
+    target = torch.full((1, 1, 3, GH, GW), 0.5, device=device)
+    background = torch.ones_like(target)  # what the renderer leaves where it draws nothing
+    for mode in ["pbf", "projection"]:
+        config = config_of("fisheye", "geer", mode)
+        image = render_opencv_cam_geer(pc, GH, GW, C2W, fxfycxcy, 0, camera_model="fisheye",
+                                       radial_coeffs=torch.zeros(1, 4, device=device),
+                                       ray_camera_model="fisheye", geer_tile_mode=mode)["render"][None]
+        loss = train.compute_loss(edict(render=image, fxfycxcy_target=fxfycxcy[None], target_image=target),
+                                  {"image": target}, config, edict()).loss
+        control = train.compute_loss(edict(render=background, fxfycxcy_target=fxfycxcy[None],
+                                           target_image=target), {"image": target}, config, edict()).loss
+        if xyz.grad is not None:
+            xyz.grad = None
+        loss.backward()
+        if mode == "projection":
+            assert image[0, 0, :, row, col].max().item() < 0.5, "the ring pixel stayed background"
+            assert loss.item() != control.item(), "the drawn pixel has to move the loss"
+            assert torch.isfinite(xyz.grad).all() and xyz.grad.abs().max().item() > 0.0
+        else:
+            assert torch.equal(image, background), "the pbf mode must not draw beyond 90 degrees"
+            assert loss.item() == control.item(), "the masked loss has to ignore the ring"
+            assert xyz.grad.abs().max().item() == 0.0, "a masked out pixel cannot train anything"
+
+
+@gpu
 def test_gradients_still_flow_in_projection_mode():
     """The mask opens up pixels the loss now has to be able to train on."""
     device = "cuda"
