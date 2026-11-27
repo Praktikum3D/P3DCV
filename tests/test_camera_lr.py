@@ -14,6 +14,7 @@ Run from the repository root:
     pytest tests/test_camera_lr.py
 """
 
+import inspect
 import math
 import os
 import sys
@@ -315,6 +316,42 @@ def test_a_decay_of_zero_updates_turns_the_decay_off():
 def test_forward_backward_passes_become_parameter_updates(fwdbwd_passes, grad_accum, expected):
     """camera_lr_decay_steps counts passes like max_fwdbwd_passes, the scheduler counts updates."""
     assert train.fwdbwd_passes_to_param_updates(fwdbwd_passes, grad_accum) == expected
+
+
+def test_the_scheduler_also_ticks_for_a_skipped_optimizer_step():
+    """train.py calls lr_scheduler.step() outside the skip branch, so the unit is the attempted update.
+
+    allowed_gradnorm_factor skips a fair share of the steps of a fine tuning run. If the scheduler
+    only moved on a real update, camera_lr_decay_steps would stretch over more passes than asked for.
+    """
+    source = inspect.getsource(train.main)
+    body = source[source.index("if not skip_optimizer_step") :]
+    tick = body.index("lr_scheduler.step()")
+    update = body.index("param_update_step += 1")
+    indent = body[:tick].rsplit("\n", 1)[-1]
+    update_indent = body[:update].rsplit("\n", 1)[-1]
+    assert len(indent) < len(update_indent), "the scheduler step has to stay outside the skip branch"
+
+
+@pytest.mark.parametrize("scale,decay_updates,warmup", [(1.0, 0, 500), (1.0, -5, 0)])
+def test_the_default_camera_schedule_prints_nothing(scale, decay_updates, warmup):
+    assert train.camera_lr_notice(scale, decay_updates, warmup) is None
+
+
+def test_a_decay_shorter_than_the_warmup_is_announced_as_a_warning():
+    """Otherwise the camera heads crawl through the warmup, freeze, and the log looks healthy."""
+    warning = train.camera_lr_notice(1.0, 100, 500)
+    assert warning is not None and warning.startswith("WARNING")
+    assert "100" in warning and "500" in warning
+    # the boundary counts as broken too, a decay that ends exactly at the warmup learns nothing
+    assert train.camera_lr_notice(1.0, 500, 500).startswith("WARNING")
+    # a decay well past the warmup is the intended setting and only reports itself
+    plain = train.camera_lr_notice(1.0, 1500, 500)
+    assert plain is not None and not plain.startswith("WARNING")
+    assert "1500" in plain
+    # a scale without a decay still says what it is
+    scaled = train.camera_lr_notice(0.5, 0, 500)
+    assert scaled is not None and "0.5" in scaled and not scaled.startswith("WARNING")
 
 
 def test_the_default_config_keeps_the_old_behaviour():

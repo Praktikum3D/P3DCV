@@ -230,10 +230,36 @@ def get_job_overview(
 
 
 def fwdbwd_passes_to_param_updates(fwdbwd_passes: int, grad_accum_steps: int) -> int:
-    """Forward/backward passes, the unit of max_fwdbwd_passes, into the parameter updates the scheduler counts."""
+    """Forward/backward passes, the unit of max_fwdbwd_passes, into the steps the scheduler counts.
+
+    The scheduler ticks once per accumulation cycle, that is once every grad_accum_steps passes, and
+    it also ticks when the optimizer step of that cycle is skipped for a bad gradient norm. Its unit is
+    therefore the attempted parameter update, which is what warmup counts too, not the update that
+    really happened. The two differ whenever a step is skipped, so param_update_step runs behind it.
+    """
     fwdbwd_passes = max(0, int(fwdbwd_passes))
     grad_accum_steps = max(1, int(grad_accum_steps))
     return -(-fwdbwd_passes // grad_accum_steps)
+
+
+def camera_lr_notice(camera_lr_scale: float, camera_lr_decay_updates: int, warmup_steps: int) -> str | None:
+    """What to print at startup about the camera head schedule, or None when it is the default one.
+
+    A decay shorter than the warmup would leave the camera heads at a near zero learning rate for
+    their whole life and then freeze them, which looks exactly like a working run in the log.
+    """
+    if float(camera_lr_scale) == 1.0 and int(camera_lr_decay_updates) <= 0:
+        return None
+    notice = f"camera heads: lr scale {float(camera_lr_scale)}"
+    if int(camera_lr_decay_updates) <= 0:
+        return notice + ", no decay"
+    notice += f", cosine decay to zero over {int(camera_lr_decay_updates)} scheduler steps"
+    if int(camera_lr_decay_updates) <= int(warmup_steps):
+        notice = (
+            f"WARNING: {notice}, which ends at or before the warmup of {int(warmup_steps)} steps, "
+            "so the camera heads never see more than the warmup learning rate"
+        )
+    return notice
 
 
 def configure_lr_scheduler(
@@ -247,10 +273,11 @@ def configure_lr_scheduler(
     """Warmup plus decay for every group, with an extra factor on the camera head groups.
 
     The camera learning rate is camera_lr(t) = lr(t) * camera_lr_scale * decay(t) with a cosine decay
-    from 1 to 0 over camera_lr_decay_updates parameter updates and exactly 0 afterwards. The focal
+    from 1 to 0 over camera_lr_decay_updates scheduler steps and exactly 0 afterwards. The focal
     length and the UCM alpha reach their correct value early and drift away over the rest of a long
-    run, so freezing them after the healthy phase keeps them there. camera_lr_decay_updates is counted
-    in parameter updates, the unit the scheduler ticks in, not in forward/backward passes.
+    run, so freezing them after the healthy phase keeps them there. camera_lr_decay_updates counts
+    scheduler steps like warmup_steps does, one per accumulation cycle and also for a cycle whose
+    optimizer step is skipped, not forward/backward passes.
     """
     total_train_steps = max(1, int(total_train_steps))
     warmup_steps = max(0, int(warmup_steps))
@@ -462,17 +489,23 @@ def main() -> None:
         float(config.training.lr),
         (float(config.training.get("beta1", 0.9)), float(config.training.get("beta2", 0.95))),
     )
+    camera_lr_scale = float(config.training.get("camera_lr_scale", 1.0))
+    # training.camera_lr_decay_steps counts forward/backward passes like max_fwdbwd_passes, the
+    # scheduler ticks once per accumulation cycle, so round up to cover the requested passes.
+    camera_lr_decay_updates = fwdbwd_passes_to_param_updates(
+        int(config.training.get("camera_lr_decay_steps", 0)), grad_accum
+    )
+    warmup_steps = int(config.training.get("warmup", 0))
+    notice = camera_lr_notice(camera_lr_scale, camera_lr_decay_updates, warmup_steps)
+    if notice is not None and is_rank0(rank):
+        print(notice)
     lr_scheduler = configure_lr_scheduler(
         optimizer,
         job_overview.num_param_updates,
-        int(config.training.get("warmup", 0)),
+        warmup_steps,
         str(config.training.get("scheduler_type", "cosine")),
-        camera_lr_scale=float(config.training.get("camera_lr_scale", 1.0)),
-        # training.camera_lr_decay_steps counts forward/backward passes like max_fwdbwd_passes, the
-        # scheduler ticks once per parameter update, so round up to cover the requested passes.
-        camera_lr_decay_updates=fwdbwd_passes_to_param_updates(
-            int(config.training.get("camera_lr_decay_steps", 0)), grad_accum
-        ),
+        camera_lr_scale=camera_lr_scale,
+        camera_lr_decay_updates=camera_lr_decay_updates,
     )
     resume_ckpt = config.training.get("resume_ckpt")
     step = 0
