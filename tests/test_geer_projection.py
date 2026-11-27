@@ -120,14 +120,24 @@ def test_pinhole_has_no_mask_at_all():
 @pytest.mark.parametrize("camera_model", ["fisheye", "ucm"])
 @pytest.mark.parametrize("tile_mode", [None, "pbf", "projection"])
 def test_training_and_evaluation_mask_the_same_pixels(camera_model, tile_mode):
-    """Both read the mask out of the same function, so they cannot drift apart again."""
+    """Both read the mask out of the same function, so they cannot drift apart again.
+
+    The evaluation reaches it through evaluate.evaluation_mask now, which is also where the explicit
+    evaluation.mask_override of the cross model comparison lives. Its default branch is still this
+    one function, and evaluate.main itself builds no mask at all.
+    """
     fxfycxcy = intrinsics(camera_model)
     config = config_of(camera_model, "geer", tile_mode)
     expected = loss_render_mask(config, fxfycxcy, H, W).mean().item()
     assert training_mask_fraction(config, fxfycxcy) == pytest.approx(expected)
-    for source in [inspect.getsource(train.compute_loss), inspect.getsource(evaluate.main)]:
-        assert "loss_render_mask(config" in source
-        assert source.count("render_mask(") == 1, "a second mask would be a second convention"
+    assert evaluate.evaluation_mask(config, fxfycxcy, H, W).mean().item() == pytest.approx(expected)
+    train_source = inspect.getsource(train.compute_loss)
+    assert "loss_render_mask(config" in train_source
+    assert train_source.count("render_mask(") == 1, "a second mask would be a second convention"
+    assert "render_mask(" not in inspect.getsource(evaluate.main)
+    eval_source = inspect.getsource(evaluate.evaluation_mask)
+    assert "loss_render_mask(config" in eval_source
+    assert "mask_override" in eval_source, "the only other mask is the one an option asks for"
 
 
 class FakeRasterization:
