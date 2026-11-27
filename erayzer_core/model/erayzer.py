@@ -57,6 +57,64 @@ def build_transformer_blocks(
     return nn.ModuleList(layers)
 
 
+CORNER_OPACITY_LOGIT = -20.0
+"""Opacity logit that makes a Gaussian invisible for good, sigmoid(-20) is about 2e-9.
+
+to_gs clamps the predicted logit at -10, but -10 is sigmoid 4.5e-5 and tens of thousands of such
+Gaussians still add up to a visible haze, so the corners get a value below that clamp. The value is a
+constant, never a prediction, so it cannot destabilise anything.
+"""
+
+
+def corner_gaussian_mask(hh, ww, ph, pw, device=None):
+    """Which Gaussian of ONE input view is born on a black corner pixel, [hh*ww*ph*pw] bool.
+
+    A fisheye image such as TartanAir lcam_fish only fills the circle that spans its width, the four
+    corners outside it are black. E-RayZer still turns every one of those pixels into a Gaussian, and
+    the loss never sees them because the target mask (render_mask with image_circle) cuts the same
+    circle away, so they are free to drift anywhere and leak into other views.
+
+    The circle is a property of the image data, pixel centres, centre (w/2, h/2), radius w/2, the same
+    definition render_mask uses. It is deliberately NOT built from the predicted intrinsics, which move
+    during training, since which pixels are black is fixed by the camera that recorded the images.
+
+    The returned order is the Gaussian order of ERayZer.forward, 'b (v hh ww ph pw) c', so pixel (y, x)
+    of a view sits at index ((y // ph * ww + x // pw) * ph + y % ph) * pw + x % pw.
+    """
+    h, w = hh * ph, ww * pw
+    y, x = torch.meshgrid(
+        torch.arange(h, device=device, dtype=torch.float32),
+        torch.arange(w, device=device, dtype=torch.float32),
+        indexing="ij",
+    )
+    outside = (x + 0.5 - w / 2) ** 2 + (y + 0.5 - h / 2) ** 2 > (w / 2) ** 2
+    return rearrange(outside, "(hh ph) (ww pw) -> (hh ww ph pw)", ph=ph, pw=pw)
+
+
+def mask_corner_opacity(opacity, corner_mask, v_input, logit=CORNER_OPACITY_LOGIT):
+    """Make the Gaussians of the black image corners invisible, opacity [b, v_input*n, 1] of logits.
+
+    corner_mask is the single view mask of corner_gaussian_mask, [n] bool, tiled over the input views
+    because the Gaussians are laid out as 'b (v hh ww ph pw) c'. The mask is a constant, so the filled
+    entries simply receive no gradient while every other entry stays bit for bit what it was.
+    """
+    tiled = corner_mask.to(opacity.device).repeat(v_input)[None, :, None]
+    return opacity.masked_fill(tiled, logit)
+
+
+def corner_masking_default(config):
+    """Whether to hide the corner Gaussians unless model.mask_input_corners says otherwise.
+
+    On for fisheye input data (camera_name contains "fish") rendered with a wide angle camera model.
+    Off for pinhole: there the loss has no mask at all, every pixel including the corners is supervised,
+    and hiding Gaussians would change a training that works.
+    """
+    dataset = config.get("dataset", edict())
+    camera_name = str(dataset.get("camera_name", "")) if isinstance(dataset, dict) else ""
+    camera_model = config.model.get("camera_model", "pinhole")
+    return "fish" in camera_name and camera_model != "pinhole"
+
+
 class GaussiansUpsampler(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -275,6 +333,18 @@ class ERayZer(nn.Module):
         self.range_func = get_point_range_func(self.config.model.gaussians)
         self.renderer = Renderer(self.config)
 
+        # Gaussians born on the black corners of a fisheye input image are never supervised, see
+        # corner_gaussian_mask. An explicit model.mask_input_corners always wins over the default.
+        self.mask_input_corners = bool(
+            self.config.model.get("mask_input_corners", corner_masking_default(self.config))
+        )
+        # not persistent: the mask is derived from the configured image size, no checkpoint carries it
+        self.register_buffer(
+            "corner_mask",
+            corner_gaussian_mask(self.hh, self.ww, self.ph, self.pw),
+            persistent=False,
+        )
+
         # config backup
         self.config_bk = copy.deepcopy(self.config)
         self.render_interpolate = config.training.get("render_interpolate", False)
@@ -457,6 +527,10 @@ class ERayZer(nn.Module):
             pw=self.pw,
         )
         xyz, features, scaling, rotation, opacity = self.upsampler.to_gs(img_aligned_gaussians)
+        if self.mask_input_corners:
+            # right here, so every later user of opacity sees the same tensor: the renderer, the video
+            # renderer and the usage and opacity statistics further down
+            opacity = mask_corner_opacity(opacity, self.corner_mask, v_input)
         img_aligned_xyz = rearrange(
             xyz,
             "b (v hh ww ph pw) c -> b v c (hh ph) (ww pw)",
