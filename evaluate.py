@@ -18,6 +18,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 import erayzer_core  # noqa: F401
+from erayzer_core.model.utils_gaussian import render_mask
 from erayzer_core.utils.camera_eval import evaluate_camera_pose_metrics
 from training.datasets import build_dataset as build_config_dataset
 
@@ -180,7 +181,15 @@ def main() -> None:
                     align_corners=False,
                 ).reshape(b, v, target.shape[2], pred.shape[-2], pred.shape[-1])
 
-            mse_per_image = (pred - target).pow(2).flatten(2).mean(dim=2)
+            camera_model = config.model.get("camera_model", "pinhole")
+            if camera_model != "pinhole":  # same pixels as the training loss
+                b, v, c, h, w = pred.shape
+                fxfycxcy = result.fxfycxcy_target.float().reshape(b * v, -1)
+                circle = "fish" in str(config.dataset.get("camera_name", ""))
+                mask = render_mask(fxfycxcy, h, w, camera_model, circle).reshape(b, v, 1, h, w)
+                mse_per_image = ((pred - target).pow(2) * mask).flatten(2).sum(2) / (mask.flatten(2).sum(2) * c).clamp_min(1.0)
+            else:
+                mse_per_image = (pred - target).pow(2).flatten(2).mean(dim=2)
             mse_sum += mse_per_image.sum()
             image_count += mse_per_image.numel()
             psnr_per_image = -10.0 * torch.log10(mse_per_image.clamp_min(1e-8))

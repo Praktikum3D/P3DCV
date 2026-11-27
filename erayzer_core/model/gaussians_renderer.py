@@ -728,7 +728,8 @@ def render_opencv_cam_gsplat(
     sh_degree: Union[int, None] = None,
     near_plane=0.2,
     bg_color=(1.0, 1.0, 1.0),
-    render_depth=False
+    render_depth=False,
+    camera_model="pinhole",
 ):
     means3D = pc.get_xyz # [N, 3]
     opacity = pc.get_opacity
@@ -754,7 +755,8 @@ def render_opencv_cam_gsplat(
                                         near_plane=near_plane,
                                         sh_degree=sh_degree, 
                                         backgrounds=bg_color,
-                                        render_mode=render_mode) # v x h x w x 3
+                                        render_mode=render_mode,
+                                        camera_model=camera_model) # v x h x w x 3
     if render_mode != 'RGB':
         render_colors, render_depth = render_colors[...,:3], render_colors[...,3:]
     else:

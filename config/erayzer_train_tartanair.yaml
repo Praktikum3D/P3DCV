@@ -93,6 +93,9 @@ training:
   scheduler_type: cosine
   grad_accum_steps: 4
   grad_clip_norm: 1.0
+  # Steps with a gradient norm above grad_clip_norm times this factor are skipped (default 2 skipped
+  # 60 to 80 percent of all fine-tuning steps). Every other step is still clipped to grad_clip_norm.
+  allowed_gradnorm_factor: 10.0
   freeze_focal_steps: 0
   no_pass_steps: 0
   l2_loss_weight: 1.0

@@ -415,7 +415,7 @@ class ERayZer(nn.Module):
         target_image = image_data_all[batch_idx, target_idx]
         v_input = input_idx.shape[1]
     
-        plucker_rays_input = cam_info_to_plucker(c2w_input, fxfycxcy_input, self.config.model.target_image, normalized=normalized, return_moment=True)
+        plucker_rays_input = cam_info_to_plucker(c2w_input, fxfycxcy_input, self.config.model.target_image, normalized=normalized, return_moment=True, camera_model=self.config.model.get("camera_model", "pinhole"))
         plucker_rays_input = rearrange(plucker_rays_input, '(b v) c h w -> b v h w c', b=b, v=v_input)
         plucker_emb_input = self.input_pose_tokenizer(plucker_rays_input)                                     # [b*v_input, n, d]
         if self.use_pe_embedding_layer:
@@ -461,7 +461,7 @@ class ERayZer(nn.Module):
         if self.config.model.hard_pixelalign:
             img_aligned_xyz = img_aligned_xyz.mean(dim=2, keepdim=True)
             img_aligned_xyz = self.range_func(img_aligned_xyz)
-            plucker_rays_input = cam_info_to_plucker(c2w_input, fxfycxcy_input, self.config.model.target_image, normalized=normalized, return_moment=False)
+            plucker_rays_input = cam_info_to_plucker(c2w_input, fxfycxcy_input, self.config.model.target_image, normalized=normalized, return_moment=False, camera_model=self.config.model.get("camera_model", "pinhole"))
             plucker_rays_input = rearrange(plucker_rays_input, '(b v) c h w -> b v c h w', b=b)
             ray_o, ray_d = plucker_rays_input.split([3, 3], dim=2)
             img_aligned_xyz = ray_o + img_aligned_xyz * ray_d
@@ -805,7 +805,7 @@ def get_cam_se3(cam_info):
     return c2w, fxfycxcy
 
 
-def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return_moment=True):
+def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return_moment=True, camera_model="pinhole"):
     '''
     c2w: [b,4,4] or [b,v,4,4]
     fxfycxcy: [b,4] or [b,v,4]
@@ -834,6 +834,9 @@ def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return
     x = (x + 0.5 - fxfycxcy[:, 2:3]) / fxfycxcy[:, 0:1]
     y = (y + 0.5 - fxfycxcy[:, 3:4]) / fxfycxcy[:, 1:2]
     z = torch.ones_like(x)
+    if camera_model == "fisheye":  # equidistant, angle to the optical axis = distance from the center / f
+        theta = torch.sqrt(x * x + y * y + 1e-12)
+        x, y, z = x * torch.sin(theta) / theta, y * torch.sin(theta) / theta, torch.cos(theta)
     ray_d = torch.stack([x, y, z], dim=2)  # [b, h*w, 3]
     ray_d = torch.bmm(ray_d, c2w[:, :3, :3].transpose(1, 2))  # [b, h*w, 3]
     ray_d = ray_d / torch.norm(ray_d, dim=2, keepdim=True)  # [b, h*w, 3]
@@ -932,6 +935,7 @@ class PoseEstimator(nn.Module):
         self.canonical_k_head.apply(_init_weights)
 
         self.f_bias = 1.25
+        self.f_scale = float(self.config.model.get("f_scale", 1.0))  # fisheye: maps the pinhole f to px per radian
 
     def forward(self, x, v):
         '''
@@ -992,7 +996,7 @@ class PoseEstimator(nn.Module):
             rt_final = rt_canonical + extrinsics_offset * mask
 
         # Predict fx/fy per view
-        fxfy_per_view = self.canonical_k_head(x) + self.f_bias  # [b, v, 1]
+        fxfy_per_view = (self.canonical_k_head(x) + self.f_bias) * self.f_scale  # [b, v, 1]
         fxfy_per_view = fxfy_per_view.repeat(1, 1, 2)           # [b, v, 2]
 
         # Average intrinsics across views
@@ -1026,7 +1030,7 @@ class PoseEstimator(nn.Module):
             raise NotImplementedError
 
         # Predict canonical intrinsics
-        fxfy_canonical = self.canonical_k_head(x_canonical[:, 0]) + self.f_bias  # [b, 1]
+        fxfy_canonical = (self.canonical_k_head(x_canonical[:, 0]) + self.f_bias) * self.f_scale  # [b, 1]
         fxfy_canonical = fxfy_canonical.unsqueeze(1).repeat(1, 1, 2)             # [b, 1, 2]
 
         # Identity canonical extrinsics
@@ -1066,7 +1070,7 @@ class PoseEstimator(nn.Module):
         x_canonical = x[:, 0:1]     # [b, 1, d]
 
         # Predict canonical intrinsics
-        fxfy_canonical = self.canonical_k_head(x_canonical[:, 0]) + self.f_bias  # [b, 1]
+        fxfy_canonical = (self.canonical_k_head(x_canonical[:, 0]) + self.f_bias) * self.f_scale  # [b, 1]
         fxfy_canonical = fxfy_canonical.unsqueeze(1).repeat(1, 1, 2)             # [b, 1, 2]
 
         # Identity canonical extrinsics
