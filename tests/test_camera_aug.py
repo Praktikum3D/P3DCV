@@ -423,12 +423,15 @@ def test_true_alpha_per_model():
 # the loss mask
 # --------------------------------------------------------------------------------------------
 
-def loss_inputs(v=3, h=32, w=32, camera_model="ucm"):
+def loss_inputs(v=3, h=32, w=32, camera_model="ucm", f=None, alpha=0.62):
+    """A render, a target and a predicted camera. The default predicted camera is the wide one of a
+    195 degree fisheye run; pass f and alpha to stand in for a narrower prediction."""
     g = torch.Generator().manual_seed(0)
     render = torch.rand(1, v, 3, h, w, generator=g)
     target = torch.rand(1, v, 3, h, w, generator=g)
-    f = (w / 2) / math.radians(195.0 / 2)
-    k = torch.tensor([[f, f, w / 2, h / 2, 0.62]]).repeat(v, 1)
+    if f is None:
+        f = (w / 2) / math.radians(195.0 / 2)
+    k = torch.tensor([[f, f, w / 2, h / 2, alpha]]).repeat(v, 1)
     if camera_model != "ucm":
         k = k[:, :4]
     result = edict(render=render, fxfycxcy_target=k[None], target_image=target)
@@ -442,7 +445,9 @@ def test_loss_uses_the_intersection_of_both_masks():
     config = loss_config("ucm")
     result, batch = loss_inputs()
     b, v, _, h, w = result.render.shape
-    camera_mask = loss_render_mask(config, result.fxfycxcy_target.reshape(b * v, -1), h, w)
+    # a data mask is about to be supplied, so the static image circle no longer applies
+    camera_mask = loss_render_mask(config, result.fxfycxcy_target.reshape(b * v, -1), h, w,
+                                   has_data_mask=True)
     camera_mask = camera_mask.reshape(b, v, 1, h, w)
 
     # a data mask that drops the left half of every view
@@ -489,6 +494,81 @@ def test_loss_applies_the_data_mask_for_a_pinhole_model_too():
     result.target_data_mask = data_mask
     masked = train.compute_loss(result, batch, config, edict())
     assert masked.mask_fraction.item() == pytest.approx(0.5, rel=1e-6)
+
+
+def effective_loss_mask(result, batch, config):
+    """The mask compute_loss really applies, recovered by probing one pixel at a time is too slow,
+    so rebuild it the way compute_loss does and check the fraction it reports agrees."""
+    from erayzer_core.model.utils_gaussian import loss_render_mask
+
+    b, v, _, h, w = result.render.shape
+    data_mask = result.get("target_data_mask")
+    mask = None
+    if config.model.camera_model != "pinhole":
+        k = result.fxfycxcy_target.detach().float().reshape(b * v, -1)
+        mask = loss_render_mask(config, k, h, w, has_data_mask=data_mask is not None)
+        mask = mask.reshape(b, v, 1, h, w)
+    if data_mask is not None:
+        mask = data_mask if mask is None else mask * data_mask
+    reported = train.compute_loss(result, batch, config, edict()).mask_fraction.item()
+    assert reported == pytest.approx(float(mask.mean()), rel=1e-6)
+    return mask
+
+
+def test_an_augmented_pinhole_sample_keeps_its_corners():
+    """The corners of a pinhole sample carry the strongest focal length signal and must be scored.
+
+    `loss_render_mask` guesses the image circle from `dataset.camera_name`, which says lcam_fish for
+    an augmented run even when this particular sample was drawn as a 90 degree pinhole whose data
+    mask is all ones. Left alone that guess throws away about 21 percent of the pinhole targets.
+    """
+    config = loss_config("ucm")  # a UCM run, but this sample was drawn as a pinhole
+    # the predicted camera of a pinhole sample is a narrow one, not the wide default
+    result, batch = loss_inputs(f=16.0, alpha=0.05)
+    _, _, _, h, w = result.render.shape
+
+    # a pinhole draw: the data mask covers the whole frame
+    result.target_data_mask = torch.ones(1, 3, 1, h, w)
+    mask = effective_loss_mask(result, batch, config)
+    assert mask[0, 0, 0, 0, 0].item() == pytest.approx(1.0), "the corner is not scored"
+    assert mask[0, 0, 0, -1, -1].item() == pytest.approx(1.0), "the corner is not scored"
+
+    # and it is exactly the predicted camera's own validity, nothing else cut away
+    from erayzer_core.model.utils_gaussian import render_mask
+
+    b, v = 1, 3
+    k = result.fxfycxcy_target.detach().float().reshape(b * v, -1)
+    predicted = render_mask(k, h, w, "ucm", image_circle=False, exact=True).reshape(b, v, 1, h, w)
+    assert torch.equal(mask, predicted)
+
+
+def test_an_augmented_fisheye_sample_still_loses_its_corners():
+    """The circle is not gone, it just comes from the sample's own data mask now."""
+    config = loss_config("ucm")
+    result, batch = loss_inputs()
+    _, _, _, h, w = result.render.shape
+
+    y, x = torch.meshgrid(torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij")
+    circle = ((x + 0.5 - w / 2) ** 2 + (y + 0.5 - h / 2) ** 2 <= (w / 2) ** 2).float()
+    result.target_data_mask = circle[None, None, None].expand(1, 3, 1, h, w).contiguous()
+
+    mask = effective_loss_mask(result, batch, config)
+    assert mask[0, 0, 0, 0, 0].item() == 0.0, "the corner must stay out for a wide angle sample"
+    assert mask[0, 0, 0, -1, -1].item() == 0.0
+    assert mask[0, 0, 0, h // 2, w // 2].item() > 0.0, "the centre must stay in"
+
+
+def test_the_image_circle_guess_is_unchanged_without_a_data_mask():
+    """No data mask means no augmentation, and then the old guess has to apply exactly as before."""
+    from erayzer_core.model.utils_gaussian import loss_render_mask
+
+    config = loss_config("ucm")
+    k = loss_inputs()[0].fxfycxcy_target.reshape(3, -1)
+    old = loss_render_mask(config, k, 32, 32)
+    assert torch.equal(loss_render_mask(config, k, 32, 32, has_data_mask=False), old)
+    # the default argument is what evaluate.py relies on, so it must be the unchanged behaviour
+    assert old[0, 0, 0, 0].item() == 0.0, "the fisheye guess still cuts the corner by default"
+    assert not torch.equal(loss_render_mask(config, k, 32, 32, has_data_mask=True), old)
 
 
 def test_loss_is_byte_identical_without_a_data_mask():

@@ -314,6 +314,18 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
     inside = 1.0
     camera_model = config.model.get("camera_model", "pinhole")
     b, v, _, h, w = pred.shape
+
+    # With camera augmentation a view also has pixels its own camera never saw, the black outside of
+    # the resampled image. Those carry no target either, so the loss counts the intersection of what
+    # the predicted camera can render and what the data actually holds. Both masks are constants.
+    # Resolved first, because its presence also tells loss_render_mask that the static image circle
+    # guessed from the dataset name no longer applies.
+    data_mask = result.get("target_data_mask")
+    if data_mask is None and "data_mask" in batch and batch["data_mask"].shape[1] == v:
+        data_mask = batch["data_mask"]
+    if data_mask is not None:
+        data_mask = data_mask.detach().to(device=pred.device, dtype=pred.dtype)
+
     mask = None
     if camera_model != "pinhole":
         # Only pixels the camera can render count, for fisheye data only inside the image circle, and only as
@@ -321,17 +333,10 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
         # no gradient and must not contribute to the loss, which is why loss_render_mask stops at 90 degrees
         # unless 3DGEER assigns its tiles by projection. The evaluation scores the very same pixels.
         fxfycxcy = result.fxfycxcy_target.detach().float().reshape(b * v, -1)
-        mask = loss_render_mask(config, fxfycxcy, h, w)
+        mask = loss_render_mask(config, fxfycxcy, h, w, has_data_mask=data_mask is not None)
         mask = mask.reshape(b, v, 1, h, w).to(pred.dtype)
 
-    # With camera augmentation a view also has pixels its own camera never saw, the black outside of
-    # the resampled image. Those carry no target either, so the loss counts the intersection of what
-    # the predicted camera can render and what the data actually holds. Both masks are constants.
-    data_mask = result.get("target_data_mask")
-    if data_mask is None and "data_mask" in batch and batch["data_mask"].shape[1] == v:
-        data_mask = batch["data_mask"]
     if data_mask is not None:
-        data_mask = data_mask.detach().to(device=pred.device, dtype=pred.dtype)
         mask = data_mask if mask is None else mask * data_mask
 
     if mask is not None:
