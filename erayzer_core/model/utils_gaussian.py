@@ -97,14 +97,34 @@ def loss_render_mask(config, fxfycxcy, h, w):
 
 def ucm_radial_coeffs(fxfycxcy, h, w):
     """Kannala Brandt coefficients [v, 4] that reproduce UCM (alpha in column 4) up to the largest valid angle,
-    by least squares on theta_d / theta - 1 = k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8."""
+    by least squares on theta_d / theta - 1 = k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8.
+
+    A view whose learned camera has collapsed gets zero coefficients, which is the equidistant fisheye
+    3DGEER renders by default. That happens when no pixel is inside the UCM image circle any more, so
+    theta_max is zero and the sample grid collapses onto the origin, or when an intrinsic is not finite.
+    There is nothing left to fit in that case, and surviving matters more than accuracy here: the renderer
+    keeps producing finite images and a defined gradient, so the camera can recover, while the old code
+    handed a rank deficient matrix to the solver and killed a 20000 step run (job 31792) at step 3930.
+    """
     _, _, _, theta, valid = pixel_angles(fxfycxcy, h, w, "ucm", exact=True)
     theta_max = torch.where(valid, theta, torch.zeros_like(theta)).flatten(1).amax(1)  # [v]
+    a = fxfycxcy[:, 4]  # [v]
+    # Below this angle the sample grid th is numerically zero and all four columns of A vanish together.
+    degenerate = ~torch.isfinite(fxfycxcy).all(1) | ~torch.isfinite(theta_max) | (theta_max < 1e-2)  # [v]
+    theta_max = torch.where(degenerate, torch.ones_like(theta_max), theta_max)  # harmless stand in
+    a = torch.where(degenerate, torch.zeros_like(a), a)[:, None]  # [v, 1]
     th = theta_max[:, None] * torch.linspace(0.02, 1.0, 64, device=theta.device)[None]  # [v, 64]
-    a = fxfycxcy[:, 4:5]
     target = torch.sin(th) / (a + (1 - a) * torch.cos(th)) / th - 1
     A = torch.stack([th**2, th**4, th**6, th**8], dim=-1)  # [v, 64, 4]
-    return torch.linalg.lstsq(A.double(), target.double()[..., None]).solution[..., 0].float()
+    # Solved through the pseudo inverse instead of torch.linalg.lstsq: the only lstsq driver CUDA offers is
+    # gels (QR), which assumes full rank and raises as soon as the fit degenerates, and the rank safe driver
+    # gelsd runs on CPU only, so it would force a .cpu() round trip of the inputs and the result. The SVD
+    # behind pinv stays on the device and blocks on the stream exactly as the old lstsq did, so it adds no
+    # new synchronisation, it drops vanishing singular values and returns the minimum norm solution, and on
+    # a healthy fit it agrees with lstsq far below the float32 the result is cast to. It costs about 6 ms
+    # against 1 ms for lstsq on a GTX 1660, once per batch element per step, a few percent of a UCM step.
+    coeffs = (torch.linalg.pinv(A.double()) @ target.double()[..., None])[..., 0]  # [v, 4]
+    return torch.where(degenerate[:, None], torch.zeros_like(coeffs), coeffs).float()
 
 
 class Renderer(nn.Module):
