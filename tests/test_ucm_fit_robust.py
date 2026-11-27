@@ -129,6 +129,31 @@ def test_a_degenerate_view_does_not_spoil_its_neighbours():
     assert (coeffs[1] == 0).all() and (coeffs[3] == 0).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gels path only exists on CUDA")
+def test_the_collapsed_camera_survives_on_the_device_that_crashed():
+    """The crash was CUDA only, so close the gap the CPU tests leave.
+
+    torch.linalg.lstsq picks the rank revealing driver gelsy on CPU and gels on CUDA, and only gels
+    treats a rank deficient matrix as an error, so the run died on the GPU while the same input is
+    harmless here. Which way gels fails depends on the batch size and the backend (job 31792 raised
+    with four views, two views silently return NaN), hence the old path is only pinned to produce
+    nothing usable, while the new one has to return the equidistant fallback.
+    """
+    fxfycxcy = intrinsics(f=0.5, alpha=0.9, v=4).cuda()  # four views, as in the run that died
+    try:
+        old = old_ucm_radial_coeffs(fxfycxcy, H, W)
+        assert not torch.isfinite(old).all(), f"the old path was expected to fail, got {old.tolist()}"
+    except torch.linalg.LinAlgError:
+        pass
+
+    coeffs = ucm_radial_coeffs(fxfycxcy, H, W)
+    assert coeffs.device == fxfycxcy.device and coeffs.dtype == torch.float32
+    assert (coeffs == 0).all(), coeffs.tolist()
+
+    healthy = ucm_radial_coeffs(intrinsics(v=2).cuda(), H, W)
+    assert torch.isfinite(healthy).all() and (healthy != 0).any()
+
+
 def test_shape_dtype_and_device_are_unchanged():
     """The renderer takes the result as is, so the contract of the function must not move."""
     for fxfycxcy in [intrinsics(v=3), intrinsics(f=0.5, alpha=0.9, v=3)]:

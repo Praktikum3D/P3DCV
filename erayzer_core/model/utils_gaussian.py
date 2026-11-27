@@ -118,9 +118,11 @@ def ucm_radial_coeffs(fxfycxcy, h, w):
     A = torch.stack([th**2, th**4, th**6, th**8], dim=-1)  # [v, 64, 4]
     # Solved through the pseudo inverse instead of torch.linalg.lstsq: the only lstsq driver CUDA offers is
     # gels (QR), which assumes full rank and raises as soon as the fit degenerates, and the rank safe driver
-    # gelsd runs on CPU only, which would put a host synchronisation into the render hot path. The SVD behind
-    # pinv drops vanishing singular values and returns the minimum norm solution, and on a healthy fit it
-    # agrees with lstsq far below the float32 the result is cast to.
+    # gelsd runs on CPU only, so it would force a .cpu() round trip of the inputs and the result. The SVD
+    # behind pinv stays on the device and blocks on the stream exactly as the old lstsq did, so it adds no
+    # new synchronisation, it drops vanishing singular values and returns the minimum norm solution, and on
+    # a healthy fit it agrees with lstsq far below the float32 the result is cast to. It costs about 6 ms
+    # against 1 ms for lstsq on a GTX 1660, once per batch element per step, a few percent of a UCM step.
     coeffs = (torch.linalg.pinv(A.double()) @ target.double()[..., None])[..., 0]  # [v, 4]
     return torch.where(degenerate[:, None], torch.zeros_like(coeffs), coeffs).float()
 
