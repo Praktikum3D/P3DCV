@@ -769,7 +769,7 @@ def render_opencv_cam_gsplat(
 
 def render_opencv_cam_geer(pc, height, width, C2W, fxfycxcy, sh_degree, near_plane=0.01, camera_model="fisheye",
                            radial_coeffs=None, bg_color=(1.0, 1.0, 1.0), ray_camera_model=None,
-                           geer_tile_mode="pbf"):
+                           geer_tile_mode="pbf", with_alpha=False, render_mode="RGB"):
     """Exact ray Gaussian rendering with 3DGEER (needs the gsplat-geer build of gsplat).
 
     The ray of every pixel is built here in PyTorch from C2W and fxfycxcy and handed to the rasterizer,
@@ -784,6 +784,10 @@ def render_opencv_cam_geer(pc, height, width, C2W, fxfycxcy, sh_degree, near_pla
     off axis, while "projection" projects the centres with the camera model above and therefore fills a
     fisheye image out to its border. View dependent colors are evaluated here. Renders one view at a time,
     as 3DGEER requires.
+
+    with_alpha adds the accumulated opacity as "alpha" [v, 1, h, w], render_mode "RGB+ED" adds the
+    expected depth as "depth". Both are off by default, so the training path gets exactly the two keys
+    it got before, "render" and a "depth" of None.
     """
     from .utils_gaussian import camera_rays  # here, because utils_gaussian imports this module
 
@@ -794,22 +798,34 @@ def render_opencv_cam_geer(pc, height, width, C2W, fxfycxcy, sh_degree, near_pla
         bg = torch.tensor([bg_color], dtype=torch.float32, device=C2W.device)
         W2C = C2W.inverse().detach()  # tile assignment only, the pose gradient comes from the rays
         rays_o, rays_d = camera_rays(C2W, fxfycxcy, height, width, ray_camera_model or camera_model)
-        renders = []
+        renders, alphas, depths = [], [], []
         for j in range(C2W.shape[0]):
             dirs = torch.nn.functional.normalize(means - C2W[j, :3, 3], dim=-1)
             colors = (eval_sh(sh_degree, shs, dirs) + 0.5).clamp_min(0.0)
             K = torch.zeros(1, 3, 3, device=C2W.device)
             f = fxfycxcy[j].detach()  # tile assignment only, the focal length gradient comes from the rays
             K[0, 0, 0], K[0, 1, 1], K[0, 0, 2], K[0, 1, 2], K[0, 2, 2] = f[0], f[1], f[2], f[3], 1.0
-            out, _, _ = rasterization(
+            out, alpha, _ = rasterization(
                 means, quats, scales, opacity, colors[None], W2C[j:j + 1], K,
                 width, height, near_plane=near_plane, packed=False, backgrounds=bg, camera_model=camera_model,
                 radial_coeffs=None if radial_coeffs is None else radial_coeffs[j:j + 1].float().detach(),
-                with_geer=True, with_eval3d=True, geer_tile_mode=geer_tile_mode,
+                with_geer=True, with_eval3d=True, geer_tile_mode=geer_tile_mode, render_mode=render_mode,
                 rays_o=rays_o[j:j + 1].contiguous(), rays_d=rays_d[j:j + 1].contiguous(),
             )
-            renders.append(out[0])
-    return {"render": torch.stack(renders).permute(0, 3, 1, 2), "depth": None}
+            if render_mode == "RGB":
+                renders.append(out[0])
+            else:  # "RGB+ED" appends the expected depth as a fourth channel
+                renders.append(out[0, ..., :3])
+                depths.append(out[0, ..., 3:])
+            if with_alpha:
+                alphas.append(alpha[0])
+    buffers = {
+        "render": torch.stack(renders).permute(0, 3, 1, 2),
+        "depth": torch.stack(depths).permute(0, 3, 1, 2) if depths else None,
+    }
+    if with_alpha:
+        buffers["alpha"] = torch.stack(alphas).permute(0, 3, 1, 2)
+    return buffers
 
 
 class DeferredGaussianRender(torch.autograd.Function):
