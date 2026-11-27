@@ -47,6 +47,9 @@ VIS_EVERY="${VIS_EVERY:-500}"
 # The fisheye F_SCALE turns the focal length of erayzer_multi.pt on TartanAir (about 1.1) into
 # px per radian near 195 degrees (0.29).
 CAMERA_MODEL="${CAMERA_MODEL:-pinhole}"
+# Diagnostic: hold the predicted focal length at this constant in normalized units (0.29383 is the true
+# equidistant value of a 195 degree lcam_fish image). Empty, the default, lets the camera head learn it.
+FIX_FOCAL_NORM="${FIX_FOCAL_NORM:-}"
 # A small near plane keeps fisheye content close to 90 degrees from being dropped.
 if [[ "$CAMERA_MODEL" != pinhole ]]; then F_SCALE="${F_SCALE:-0.26}" NEAR="${NEAR:-0.01}"; else F_SCALE="${F_SCALE:-1.0}" NEAR="${NEAR:-0.2}"; fi
 
@@ -105,8 +108,12 @@ EXTRA_ARGS=(
     -s model.near_plane "$NEAR"
     -s model.alpha_init "${ALPHA_INIT:-0.62}"
     -s model.renderer "${RENDERER:-gsplat}"
-    "$@"
 )
+# Only a set FIX_FOCAL_NORM adds the key, so a normal run never sees it and keeps the old behaviour.
+if [[ -n "$FIX_FOCAL_NORM" ]]; then
+    EXTRA_ARGS+=(-s model.fix_focal_norm "$FIX_FOCAL_NORM")
+fi
+EXTRA_ARGS+=("$@")
 if [[ -n "$WANDB_PROJECT" ]]; then
     EXTRA_ARGS=(
         -s training.wandb_project "$WANDB_PROJECT"

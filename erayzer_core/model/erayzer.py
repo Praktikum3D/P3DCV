@@ -127,6 +127,10 @@ class ERayZer(nn.Module):
             "freeze_focal_steps",
             self.config.training.get("no_pass_steps", 0),
         )
+        # Diagnostic run: pin the predicted focal length to this constant in normalized units.
+        # None (the default, and the only state of a normal run) leaves the prediction untouched.
+        fix_focal_norm = self.config.model.get("fix_focal_norm", None)
+        self.fix_focal_norm = None if fix_focal_norm is None else float(fix_focal_norm)
  
         # image tokenizer
         self.image_tokenizer = nn.Sequential(
@@ -397,6 +401,8 @@ class ERayZer(nn.Module):
         pred_c2w, pred_fxfycxcy = get_cam_se3(cam_info) # [b*v_all, 4, 4], [b*v_all, 4]
         pred_c2w = rearrange(pred_c2w, '(b v) n d -> b v n d', b=b)
         pred_fxfycxcy = rearrange(pred_fxfycxcy, '(b v) d -> b v d', b=b)
+        if self.fix_focal_norm is not None:  # experiment: hold the focal length at a constant, before it reaches any ray
+            pred_fxfycxcy = override_focal(pred_fxfycxcy, self.fix_focal_norm)
         if hasattr(self, "alpha_head"):  # UCM alpha as a fifth intrinsic, shared by the views of a scene
             alpha = torch.sigmoid(self.alpha_head(rearrange(cam_tokens, '(b v) d -> b v d', b=b).mean(1)).float())  # bf16 would saturate at 1
             pred_fxfycxcy = torch.cat([pred_fxfycxcy, alpha[:, None].expand(-1, v_all, -1).to(pred_fxfycxcy)], dim=-1)
@@ -812,6 +818,24 @@ def get_cam_se3(cam_info):
     c2w = torch.cat([Rt, 
                     torch.tensor([0, 0, 0, 1], dtype=R.dtype, device=R.device).view(1, 1, 4).repeat(b, 1, 1)], dim=1)  # [b,4,4]
     return c2w, fxfycxcy
+
+
+def override_focal(fxfycxcy, value):
+    '''
+    Replace the focal length columns fx and fy by a constant, with no gradient path to them.
+
+    fxfycxcy: [..., 4] or [..., 5] (UCM alpha last), in normalized units (the ones camera/fx_norm logs)
+    value: the constant focal length, e.g. 0.29383 for an equidistant 195 degree fisheye
+
+    A learning rate of zero does not hold the focal length still, because the camera head reads
+    features from the shared transformer, which keeps learning. Writing the value in does hold it
+    still, and it is the only way to ask whether a collapsing focal length is cause or symptom.
+    Everything else (cx, cy, the UCM alpha, the pose) stays exactly as predicted and keeps its
+    gradient; the two replaced columns get none, so the camera head is not pulled towards the
+    constant either.
+    '''
+    fixed = torch.full_like(fxfycxcy[..., :2], float(value))
+    return torch.cat([fixed, fxfycxcy[..., 2:]], dim=-1)
 
 
 def cam_info_to_plucker(c2w, fxfycxcy, target_imgs_info, normalized=True, return_moment=True, camera_model="pinhole"):
