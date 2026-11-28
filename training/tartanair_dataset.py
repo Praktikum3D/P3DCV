@@ -21,6 +21,12 @@ from training.camera_augmentation import (
     remap_views,
     sample_camera,
 )
+from training.line_detection import (
+    DEFAULT_MAX_COUNT,
+    DEFAULT_MIN_LENGTH,
+    DEFAULT_NUM_SAMPLES,
+    detect_lines_in_views,
+)
 
 # TartanAir NED body axes (x forward, y right, z down) -> OpenCV camera axes (x right, y down, z forward).
 _R_CV_FROM_NED = np.array(
@@ -192,6 +198,12 @@ class TartanAirDataset(Dataset):
         camera_augmentation: bool = False,
         camera_aug_mix: Optional[Dict[str, float]] = None,
         camera_aug_supersample: int = DEFAULT_SUPERSAMPLE,
+        detect_lines: bool = False,
+        line_detector: str = "auto",
+        line_min_length: float = DEFAULT_MIN_LENGTH,
+        line_max_count: int = DEFAULT_MAX_COUNT,
+        line_samples: int = DEFAULT_NUM_SAMPLES,
+        line_chain: bool = True,
     ) -> None:
         self.dataset_path = os.path.abspath(os.path.expanduser(dataset_path))
         self.camera_name = camera_name
@@ -208,6 +220,17 @@ class TartanAirDataset(Dataset):
                 "dataset.camera_augmentation needs a fisheye source, set dataset.camera_name to "
                 f"lcam_fish (got {self.camera_name!r})"
             )
+
+        # Line detection: find straight segments on the image the model will actually see, so the
+        # plumb line residual can be evaluated on them later. Default off, and off means not one
+        # line of this runs; see `training/line_detection.py` for what a straight segment means on
+        # a wide angle image.
+        self.detect_lines = bool(detect_lines)
+        self.line_detector = str(line_detector)
+        self.line_min_length = float(line_min_length)
+        self.line_max_count = max(1, int(line_max_count))
+        self.line_samples = max(1, int(line_samples))
+        self.line_chain = bool(line_chain)
 
         self.trajectories = _discover_trajectories(self.dataset_path, camera_name=camera_name)
 
@@ -366,6 +389,42 @@ class TartanAirDataset(Dataset):
         }
         return images, intrinsics, extra
 
+    def _detect_lines(
+        self, images: torch.Tensor, data_mask: Optional[torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Straight line segments of every view of this sample, padded into batch tensors.
+
+        Runs on `images`, which is the sample as it leaves the loader, so with camera augmentation
+        on it runs AFTER the remap: the segments belong to the image the model sees and to the
+        camera whose intrinsics the residual will be evaluated with. Running it on the 1000 x 1000
+        source instead would find the segments of a different camera and the residual would be
+        meaningless.
+
+        Inside the data mask only, when there is one: the border between data and padding of a
+        remapped camera is a strong, perfectly straight edge that the detector would otherwise
+        report as the longest segment in every single view, and it belongs to no 3D line at all.
+
+        Every view is detected, not only the input views. The split into input and target views is
+        drawn in the model (`ERayZer._split_indices`), not here, so the loader cannot know which
+        views will be inputs; the consumer picks its views out of the per view tensors with the same
+        index it uses for the images.
+
+        Returns `line_pixels` [v, line_max_count, line_samples, 2] float32, padded with -1, and
+        `line_count` [v] int64, the number of real segments of each view. The padded width is the
+        fixed knob and not the largest count found, so that the default collate can stack samples.
+        """
+        masks = None if data_mask is None else [data_mask[i] for i in range(data_mask.shape[0])]
+        pixels, counts = detect_lines_in_views(
+            [images[i] for i in range(images.shape[0])],
+            masks=masks,
+            min_length=self.line_min_length,
+            max_count=self.line_max_count,
+            num_samples=self.line_samples,
+            detector=self.line_detector,
+            chain=self.line_chain,
+        )
+        return {"line_pixels": pixels, "line_count": counts}
+
     def _select_views(self, num_frames: int) -> List[int]:
         if num_frames < self.num_views:
             return []
@@ -451,6 +510,9 @@ class TartanAirDataset(Dataset):
                     intrinsics.append(intr)
                 stacked_images = torch.stack(images, dim=0)
                 stacked_intr = torch.stack(intrinsics, dim=0)
+
+            if self.detect_lines:
+                extra.update(self._detect_lines(stacked_images, extra.get("data_mask")))
 
             return {
                 "image": stacked_images,
