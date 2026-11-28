@@ -42,6 +42,7 @@ from training.line_detection import (  # noqa: E402
     detect_line_segments,
     detect_lines_in_views,
     draw_segments,
+    image_circle_mask,
     link_segments,
     polyline_length,
     resolve_min_length,
@@ -49,6 +50,7 @@ from training.line_detection import (  # noqa: E402
     sample_segment_pixels,
     to_gray_uint8,
 )
+from training.tartanair_dataset import DEFAULT_LINE_NATIVE_SIZE  # noqa: E402
 from training.line_geometry import (  # noqa: E402
     DEGENERATE_SPREAD,
     pixel_ray_directions,
@@ -139,6 +141,11 @@ EUCM = [300.0, 300.0, 500.0, 500.0, 0.6, 1.0]
 
 @pytest.mark.parametrize("camera_model,intrinsics", [
     ("pinhole", FISHEYE), ("fisheye", FISHEYE), ("ucm", UCM), ("eucm", EUCM),
+    # beta away from 1 on both sides, so the one term that only an eucm camera has is covered and
+    # not silently skipped by a beta that multiplies through as the identity.
+    ("eucm", [300.0, 300.0, 500.0, 500.0, 0.6, 0.5]),
+    ("eucm", [300.0, 300.0, 500.0, 500.0, 0.6, 2.0]),
+    ("eucm", [300.0, 300.0, 500.0, 500.0, 0.2, 1.7]),
 ])
 def test_pixel_ray_directions_match_camera_rays(camera_model, intrinsics):
     """The subpixel ray builder is `utils_gaussian.camera_rays` on a grid, bit for bit.
@@ -826,10 +833,11 @@ def test_dataset_default_is_byte_identical(fisheye_root):
         assert torch.equal(before[key], after[key]), f"{key} moved with the flag off"
 
 
-def test_dataset_adds_padded_line_tensors(fisheye_root):
-    """With the flag on: fixed shapes, honest counts and -1 everywhere beyond them."""
+@pytest.mark.parametrize("native", [True, False])
+def test_dataset_adds_padded_line_tensors(fisheye_root, native):
+    """With the flag on: fixed shapes, honest counts and -1 everywhere beyond them, either way."""
     data = build_dataset(fisheye_root, detect_lines=True, line_max_count=6, line_samples=5,
-                         line_min_length=0.15)
+                         line_min_length=0.15, line_detect_native=native, line_native_size=512)
     sample = data[0]
 
     views = sample["image"].shape[0]
@@ -851,14 +859,16 @@ def test_dataset_adds_padded_line_tensors(fisheye_root):
         assert valid_segment_mask(sample["line_pixels"][view]).sum() == count
 
 
-def test_dataset_lines_are_detected_after_the_remap(fisheye_root):
+@pytest.mark.parametrize("native", [True, False])
+def test_dataset_lines_live_in_the_drawn_camera(fisheye_root, native):
     """With camera augmentation the lines belong to the drawn camera, not to the source frame.
 
-    Checked where it can be checked without knowing the drawn camera: the lines lie inside the
-    sample's own data mask, which only exists after the remap, and they fit the remapped image.
+    Checked where it can be checked without reimplementing the remap: the lines lie inside the
+    sample's own data mask, which only exists after the remap and whose shape is the drawn camera's.
     """
     data = build_dataset(fisheye_root, camera_augmentation=True, detect_lines=True,
-                         line_max_count=8, line_samples=6, line_min_length=0.15)
+                         line_max_count=8, line_samples=6, line_min_length=0.15,
+                         line_detect_native=native)
     pyrandom.seed(5)
     sample = data[0]
     assert "data_mask" in sample and "line_pixels" in sample
@@ -870,6 +880,151 @@ def test_dataset_lines_are_detected_after_the_remap(fisheye_root):
             columns = torch.round(row[:, 0] - 0.5).long().clamp(0, 255)
             rows = torch.round(row[:, 1] - 0.5).long().clamp(0, 255)
             assert bool(mask[view][rows, columns].all()), "a line sits outside the data mask"
+
+
+def test_the_unaugmented_path_masks_the_image_circle(fisheye_root):
+    """The rim of the fisheye circle is not a 3D line and must not be reported as one.
+
+    It used to be: with no camera augmentation there is no `data_mask`, detection ran unmasked and
+    the longest line in every view was the border of the data, identical in all of them.
+    """
+    for native in (True, False):
+        data = build_dataset(fisheye_root, detect_lines=True, line_max_count=16, line_samples=8,
+                             line_min_length=0.15, line_detect_native=native)
+        sample = data[0]
+        radius = 256 / 2.0
+        for view in range(sample["image"].shape[0]):
+            count = int(sample["line_count"][view])
+            assert count > 0, f"native={native}: no lines at all"
+            for row in sample["line_pixels"][view, :count]:
+                distance = torch.hypot(row[:, 0] - radius, row[:, 1] - radius)
+                assert float(distance.max()) <= radius - 1.0, (
+                    f"native={native}: a line runs along the rim of the image circle"
+                )
+
+
+OPERATING_POINT = 1.0372
+"""Where the trained model actually sits: a field of view of 188 degrees instead of 195, which for
+an equidistant camera is a focal length 195 / 188 = 1.0372 times the true one. A line loss is only
+worth having if it pushes the camera back from there, so that is where the gradient is checked."""
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.dirname(os.path.dirname(SAMPLE_FRAME))),
+                    reason="no lcam_fish sample trajectory")
+def test_the_native_path_is_sharper_on_real_frames():
+    """Why native detection is the default, measured end to end through the loader on real frames.
+
+    At 256 pixels the detector's endpoint noise buries the signal: the residual there barely tells
+    the true camera from a wrong one, and at the operating point the model sits at today its
+    gradient can point the wrong way, which would make a line loss push the field of view further
+    away from 195 degrees. Detecting on the source frame and mapping the pixels into the view fixes
+    that without changing what the residual is evaluated on.
+    """
+    sample_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(SAMPLE_FRAME))))
+    f_true = 256 / math.radians(195.0)
+
+    def measure(**options):
+        data = build_dataset(sample_root, detect_lines=True, line_max_count=32, line_samples=8,
+                             num_views=4, normalize_intrinsics=False, **options)
+        pixels = data[0]["line_pixels"]
+
+        def at(factor):
+            camera = torch.tensor([f_true * factor, f_true * factor, 128.0, 128.0], requires_grad=True)
+            value = plumbline_residual_mean(camera, "fisheye", pixels)
+            value.backward()
+            return float(value), float(camera.grad[0])
+
+        true_value, _ = at(1.0)
+        _, gradient = at(OPERATING_POINT)
+        wide, _ = at(1.4)
+        return int(pixels.shape[0]), true_value, wide / max(true_value, 1e-20), gradient
+
+    views, native_true, native_contrast, native_gradient = measure(line_detect_native=True)
+    _, view_true, view_contrast, view_gradient = measure(line_detect_native=False)
+    print(f"\nnative source detection: residual {native_true:.2e} at the true camera, "
+          f"x1.4 is {native_contrast:.1f} times worse, gradient at f x {OPERATING_POINT} "
+          f"{native_gradient:+.2e}")
+    print(f"256 pixel view detection: residual {view_true:.2e}, x1.4 is {view_contrast:.1f} times "
+          f"worse, gradient at f x {OPERATING_POINT} {view_gradient:+.2e}")
+
+    assert views == 4
+    assert native_gradient > 0.0, (
+        f"the gradient at the operating point is {native_gradient:.2e}, it has to push the focal "
+        f"length back down towards the true one"
+    )
+    assert native_contrast > 3.0, f"a 1.4 times wrong camera only scores {native_contrast:.1f} times worse"
+    assert native_contrast > 1.5 * view_contrast, (
+        f"detecting on the source is no sharper than on the view: {native_contrast:.1f} against "
+        f"{view_contrast:.1f}"
+    )
+
+
+def test_the_native_path_falls_back_when_the_frames_are_not_fisheye(tmp_path):
+    """A dataset without 1000 pixel square source frames still works, on the view path."""
+    image, _ = fisheye_curve_image(size=320, line_width=3)
+    write_trajectory(str(tmp_path), [image, image, image], camera="lcam_front")
+    data = build_dataset(str(tmp_path), camera_name="lcam_front", detect_lines=True,
+                         line_max_count=4, line_samples=4, line_min_length=0.15)
+    sample = data[0]
+    assert sample["line_pixels"].shape == (2, 4, 4, 2)
+    assert data._is_fisheye_source is False
+
+
+def test_mapping_source_pixels_into_a_drawn_camera():
+    """`map_fisheye_pixels` is the remap run backwards, checked against the remap's own ray math.
+
+    This is what lets lines be detected on the sharp source and still be expressed in the pixels of
+    the view, so it has to agree with `camera_augmentation.camera_rays`, which builds the remap.
+    """
+    from training.camera_augmentation import (
+        FISH_F,
+        FISH_SIZE as SOURCE,
+        IDENTITY_FISHEYE,
+        AugCamera,
+        camera_rays,
+        fisheye_pixels,
+        map_fisheye_pixels,
+    )
+
+    size = 256
+    for camera in (AugCamera("pinhole", 90.0), AugCamera("fisheye", 150.0),
+                   AugCamera("ucm", 160.0, 0.5), IDENTITY_FISHEYE):
+        # Walk the output grid of the remap, find where each output pixel reads in the source, and
+        # check that the map sends that source pixel back to the output pixel it came from.
+        rays, valid, _, _ = camera_rays(camera.model, camera.fov_deg, size, camera.alpha)
+        source_x, source_y, inside = fisheye_pixels(rays)
+        take = valid & inside
+        # Template pixel centres sit at integers, this repository's half a pixel further on.
+        source = np.stack([source_x[take] + 0.5, source_y[take] + 0.5], axis=-1)
+        want = np.stack(np.meshgrid(np.arange(size), np.arange(size)), axis=-1)[take] + 0.5
+
+        got, ok = map_fisheye_pixels(source, camera, size)
+        assert ok.mean() > 0.95, f"{camera.model}: only {ok.mean():.2f} of the output is imaged"
+        error = np.abs(got[ok] - want[ok]).max()
+        assert error < 1e-3, f"{camera.model}: the map is off by {error:.3e} px"
+
+    # The unaugmented case has to come out as the plain scale it is.
+    pixels = np.array([[500.0, 500.0], [400.0, 620.0], [999.0, 500.0]], dtype=np.float32)
+    got, ok = map_fisheye_pixels(pixels, IDENTITY_FISHEYE, 250)
+    assert np.allclose(got[:2], pixels[:2] * 0.25, atol=1e-4)
+    assert bool(ok[0]) and bool(ok[1])
+
+    # A source pixel the drawn camera cannot see is reported invalid rather than placed somewhere.
+    far = np.array([[500.0, 10.0]], dtype=np.float32)  # near the 195 degree rim
+    assert not map_fisheye_pixels(far, AugCamera("pinhole", 90.0), 256)[1][0]
+
+    # Resizing the source first is a pure scale and must change nothing.
+    half, _ = map_fisheye_pixels(pixels * 0.5, AugCamera("ucm", 160.0, 0.5), 256, source_size=500)
+    full, _ = map_fisheye_pixels(pixels, AugCamera("ucm", 160.0, 0.5), 256, source_size=1000)
+    assert np.allclose(half, full, atol=1e-3)
+
+
+def test_the_image_circle_mask_covers_the_fisheye_frame():
+    mask = image_circle_mask(64, margin=2.0)
+    assert mask.shape == (64, 64)
+    assert not mask[0, 0] and not mask[63, 63], "the corners of a fisheye frame carry no data"
+    assert mask[32, 32], "the middle of the frame is data"
+    assert not mask[32, 63], "the rim of the circle is not inside the margin"
 
 
 def test_views_helper_pads_every_view_to_the_same_width():
@@ -904,10 +1059,15 @@ def test_config_knobs_reach_the_dataset(fisheye_root):
     data = build_from_config(config, split="train")
     assert data.detect_lines is True
     assert data.line_max_count == 9 and data.line_samples == 4 and data.line_chain is True
+    assert data.line_detect_native is True and data.line_native_size == DEFAULT_LINE_NATIVE_SIZE
     assert data[0]["line_pixels"].shape[1:] == (9, 4, 2)
 
     config.dataset.line_chain = False
-    assert build_from_config(config, split="train").line_chain is False
+    config.dataset.line_detect_native = False
+    config.dataset.line_native_size = 768
+    rebuilt = build_from_config(config, split="train")
+    assert rebuilt.line_chain is False and rebuilt.line_detect_native is False
+    assert rebuilt.line_native_size == 768
 
     config.dataset.detect_lines = False
     assert build_from_config(config, split="train").detect_lines is False

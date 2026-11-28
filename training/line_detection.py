@@ -38,19 +38,28 @@ real `data-sample` frames the residual over the chains then has its minimum exac
 focal length and rises on both sides, by a factor of 51 at 0.8 times it and 32 at 1.4 times it
 (1000 x 1000, `scripts/line_sanity_check.py --sweep`).
 
-Resolution matters, and a reader planning to use this at the 256 pixel training resolution should
-know the numbers. The residual itself is scale free: detect at 1000 and scale the pixels down to
-256, and the curve over focal lengths is the same to three digits. What changes is the accuracy of
-the detector. Its endpoint noise is a fraction of a pixel at any resolution, so in angle it grows
-with the shrinking image, and at 256 it is about six times the noise floor at 1000. The minimum
-stays near the true camera, but it is shallow and sits slightly wide: the pooled minimum over eight
-frames is at 1.0 to 1.1 times the true focal length, and the contrast at 1.4 times it falls from
-32 to 2.3. Per frame the minimum is still in 0.9 to 1.1 on all eight. Lines at 256 pixels are a weak
-constraint, not a missing one, and they lean towards a slightly too narrow camera, which is worth
-remembering for the 188 degree question.
+Detect on the source, not on the view
+-------------------------------------
+Resolution decides whether any of this works, and the answer is not the comfortable one. The
+residual itself is scale free: detect at 1000 and scale the pixels down to 256, and the curve over
+focal lengths is the same to three digits. What is not scale free is the detector. Its endpoint
+noise is a fraction of a pixel at any resolution, so in ANGLE it grows as the image shrinks, and at
+256 pixels it buries the signal. Measured over eight real frames at the operating point the trained
+model sits at today, a field of view of 188 degrees instead of 195, so a focal length 1.0372 times
+the true one: detecting on the 256 pixel view the wrong camera scores LOWER than the true one and
+the gradient points further away from 195 degrees. A line loss built on 256 pixel detections would
+work against the thing it is meant to fix. It is not a weak constraint there, it is an adversarial
+one.
 
-Cost, measured on this GTX 1660 box: 33 ms per 256 x 256 view, 5 ms of detection and 23 ms of
-linking, and 255 ms per 1000 x 1000 frame.
+The way out costs nothing in correctness: detect on the sharp source frame and map the pixels into
+the view analytically with `camera_augmentation.map_fisheye_pixels`, which unprojects with the
+known equidistant source law and reprojects with the drawn camera. The lines then sit in exactly
+the pixels of the image the model sees, carrying the accuracy of the source. That is what
+`TartanAirDataset` does by default; see its DEFAULT_LINE_NATIVE_SIZE for the measured table.
+
+Cost, averaged over eight `data-sample` frames on this GTX 1660 box, detection and linking only:
+57 ms for a 256 x 256 view, 218 ms at 512 and about 1 s for a full 1000 x 1000 frame. A busy frame
+costs several times a sparse one, so these are an order of magnitude and not a promise.
 
 A chain is still reported as a `LineSegments` row: `endpoints` holds its chord (first and last
 point) and `score` its traced length, while `pixels` follows the actual polyline, and `pixels` is
@@ -430,6 +439,18 @@ def resolve_min_length(min_length: float, image_hw: Tuple[int, int]) -> float:
     if min_length < 1.0:
         return float(min_length) * float(min(image_hw))
     return float(min_length)
+
+
+def image_circle_mask(size: int, margin: float = 2.0) -> np.ndarray:
+    """The circle a full frame fisheye images, [size, size] bool, in this repository's convention.
+
+    `lcam_fish` fills a circle spanning the image width and leaves the corners black. The border of
+    that circle is a long, perfectly smooth arc that the detector happily reports and that belongs
+    to no 3D line at all, so every caller working on an unaugmented fisheye frame has to mask it;
+    `margin` keeps the few pixels of interpolated edge out as well.
+    """
+    y, x = np.mgrid[0:size, 0:size]
+    return np.hypot(x + 0.5 - size / 2.0, y + 0.5 - size / 2.0) <= size / 2.0 - margin
 
 
 def detect_line_segments(

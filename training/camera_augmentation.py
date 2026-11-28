@@ -157,6 +157,67 @@ def camera_rays(
     return rays, valid, f, c
 
 
+IDENTITY_FISHEYE = AugCamera("fisheye", FISH_FOV_DEG, None)
+"""The camera an unaugmented sample still has: `lcam_fish` itself, only resized.
+
+`remap_views` with this camera and output side S would reproduce the source frame scaled to S, and
+`map_fisheye_pixels` with it is exactly the uniform scale S / 1000. Having it as a camera means the
+unaugmented and the augmented path share one piece of code instead of two that can drift.
+"""
+
+
+def map_fisheye_pixels(
+    pixels: np.ndarray,
+    camera: AugCamera,
+    size: int,
+    source_size: int = FISH_SIZE,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Where pixels of an `lcam_fish` frame land in the image of a drawn camera, analytically.
+
+    `pixels` [..., 2] in the source frame, in this repository's convention (centre of pixel
+    (col, row) at (col + 0.5, row + 0.5), so the principal point of a square frame is at
+    source_size / 2). `source_size` may be smaller than 1000 if the frame was resized first, which
+    is a pure scale and changes nothing but the focal length. Returns the pixels in the output
+    image of side `size`, same shape, and a boolean mask [...] of the ones the drawn camera images
+    at all.
+
+    Both cameras look along the same axis, so the azimuth phi is untouched and only the radius
+    changes: unproject the source radius with the equidistant law theta = r / f_source, then
+    project theta with the drawn camera's own law. That is `remap_views` run backwards, exactly,
+    and it is what lets lines be detected on the sharp 1000 pixel source and still be expressed in
+    the pixels of the 256 pixel view the model sees, which is where the residual needs them.
+    """
+    points = np.asarray(pixels, dtype=np.float64)
+    source_f = FISH_F * (float(source_size) / FISH_SIZE)
+    dx = points[..., 0] - float(source_size) / 2.0
+    dy = points[..., 1] - float(source_size) / 2.0
+    radius = np.hypot(dx, dy)
+    theta = radius / source_f
+    phi = np.arctan2(dy, dx)
+
+    # The same ranges `camera_rays` gives the remap, so a pixel counts as imaged here exactly when
+    # the remap filled it. A pinhole has no angular limit of its own, its field of view is only
+    # measured across the image width and its corners reach further; the other two stop at fov / 2.
+    half = math.radians(float(camera.fov_deg)) / 2.0
+    if camera.model == "pinhole":
+        valid = theta < math.pi / 2.0
+        rho = np.tan(np.clip(theta, 0.0, 0.499 * math.pi))
+    elif camera.model == "fisheye":
+        valid = theta <= half
+        rho = theta
+    elif camera.model == "ucm":
+        valid = (theta <= half) & (theta < ucm_theta_max(float(camera.alpha)))
+        rho = ucm_rho_norm(np.clip(theta, 0.0, half), float(camera.alpha))
+    else:
+        raise ValueError(f"unknown camera model {camera.model!r}")
+
+    f = focal_for_fov(camera.model, float(camera.fov_deg), int(size), camera.alpha)
+    centre = float(size) / 2.0
+    out = np.stack([centre + f * rho * np.cos(phi), centre + f * rho * np.sin(phi)], axis=-1)
+    valid &= np.all((out >= 0.0) & (out <= float(size)), axis=-1)
+    return out.astype(np.float32), valid
+
+
 def fisheye_pixels(rays: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Pixel coordinates in `lcam_fish` for unit rays, plus a mask of rays it covers.
 

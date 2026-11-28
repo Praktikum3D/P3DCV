@@ -11,6 +11,13 @@ Both normalisations are reported, and with `--sweep` a whole range of focal fact
 shows that the trace normalisation has no minimum at all while the in plane one does. Pass
 `--no-chain` to see the same numbers on raw detector segments, which have no signal either.
 
+`--size` sets where the lines are detected and `--target-size` the view their pixels are expressed
+in, which is the loader's native pathway written out: `--size 512 --target-size 256` is what
+`TartanAirDataset` does by default, `--size 256 --target-size 256` is detecting on the view itself.
+The last block reports the residual and its gradient at the operating point the trained model sits
+at today (188 instead of 195 degrees); the gradient there has to point back towards the true focal
+length, and on a 256 pixel detection it does not.
+
 The lines are drawn on the frame and written next to the numbers.
 
 Run inside the container:
@@ -39,14 +46,9 @@ from training.line_detection import (  # noqa: E402
     DEFAULT_NUM_SAMPLES,
     detect_line_segments,
     draw_segments,
+    image_circle_mask,
 )
 from training.line_geometry import DEFAULT_TRIM, plumbline_residual_mean  # noqa: E402
-
-
-def image_circle_mask(size: int, radius: float) -> np.ndarray:
-    """The pixels the 195 degree fisheye actually images: a circle spanning the image width."""
-    y, x = np.mgrid[0:size, 0:size]
-    return np.hypot(x + 0.5 - size / 2.0, y + 0.5 - size / 2.0) <= radius
 
 
 def main() -> int:
@@ -54,6 +56,12 @@ def main() -> int:
     parser.add_argument("--frame", required=True, nargs="+", help="one or more square lcam_fish pngs")
     parser.add_argument("--out", default="", help="where to write the line figure")
     parser.add_argument("--size", type=int, default=FISH_SIZE, help="rescale the frame to this before detecting")
+    parser.add_argument("--target-size", type=int, default=0,
+                        help="evaluate the residual in the pixels of a view of this side, 0 for the "
+                             "detection size. The map is the exact scale of an unaugmented sample, "
+                             "so this shows what the loader's native pathway delivers to a 256 view")
+    parser.add_argument("--operating-point", type=float, default=1.0372,
+                        help="focal length factor the trained model sits at, 195 / 188 degrees")
     parser.add_argument("--wrong-scale", type=float, default=1.4, help="focal length factor of the wrong camera")
     parser.add_argument("--min-length", type=float, default=DEFAULT_MIN_LENGTH,
                         help="fraction of the image side, or pixels when 1 or above")
@@ -77,7 +85,7 @@ def main() -> int:
         started = time.perf_counter()
         lines = detect_line_segments(
             image,
-            mask=image_circle_mask(size, size / 2.0 - 2.0),
+            mask=image_circle_mask(size),
             min_length=args.min_length,
             max_count=args.max_count,
             num_samples=args.samples,
@@ -91,16 +99,23 @@ def main() -> int:
     if not any(len(lines) for lines in found):
         raise SystemExit("no lines found, nothing to compare")
 
-    # The true camera of lcam_fish, scaled with the image: equidistant, f pixels per radian.
-    f_true = FISH_F * scale
-    centre = size / 2.0
+    # The residual is evaluated in the pixels of a view of side `target`, which for an unaugmented
+    # sample is the detection scaled, exactly what `map_fisheye_pixels` does in the loader.
+    target = int(args.target_size) or size
     pixels = torch.from_numpy(np.concatenate([lines.pixels for lines in found if len(lines)]))
+    pixels = pixels * (target / size)
     scores = np.concatenate([lines.score for lines in found if len(lines)])
+
+    # The true camera of lcam_fish at the evaluated side: equidistant, f pixels per radian.
+    f_true = FISH_F * (target / FISH_SIZE)
+    centre = target / 2.0
     print(f"frames     {len(args.frame)}, first {args.frame[0]}")
-    print(f"size       {size} x {size}, {FISH_FOV_DEG} degree equidistant, f_true {f_true:.2f} px")
+    print(f"detected   at {size} x {size}, evaluated at {target} x {target}, "
+          f"{FISH_FOV_DEG} degree equidistant, f_true {f_true:.2f} px")
     print(f"detection  {'chained' if not args.no_chain else 'raw segments'}, "
           f"{elapsed / len(args.frame):.1f} ms per frame")
-    print(f"lines      {len(pixels)}, lengths {scores.min():.1f} to {scores.max():.1f} px")
+    print(f"lines      {len(pixels)}, lengths {scores.min():.1f} to {scores.max():.1f} px "
+          f"(at the detection size)")
 
     def evaluate(factor, normalize, trim=DEFAULT_TRIM):
         intrinsics = torch.tensor([f_true * factor, f_true * factor, centre, centre], dtype=torch.float32)
@@ -124,6 +139,15 @@ def main() -> int:
         print(f"{'':>10} wrong / true = {wrong_mean / max(true_mean, 1e-20):6.2f}, "
               f"the gradient at the wrong camera points {verdict}")
 
+    # The question that decides whether a line loss helps the training run that exists today.
+    operating, operating_grad = evaluate(float(args.operating_point), "inplane")
+    verdict = "towards the true f" if operating_grad > 0 else "AWAY from the true f, ADVERSARIAL"
+    print()
+    print(f"at the model operating point f x {args.operating_point:.4f} "
+          f"(field of view {195.0 / args.operating_point:.1f} degrees) the in plane residual is "
+          f"{operating:.3e}, {operating / max(true_mean, 1e-20):.2f} times the one at the true "
+          f"camera,\nand its gradient {operating_grad:+.3e} points {verdict}")
+
     if args.sweep:
         factors = [0.6, 0.7, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2, 1.4, 1.8, 2.5]
         print()
@@ -137,7 +161,7 @@ def main() -> int:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         # Two panels of the first frame: what the detector reports and what survives the linking.
         raw = detect_line_segments(
-            frames[0], mask=image_circle_mask(size, size / 2.0 - 2.0),
+            frames[0], mask=image_circle_mask(size),
             min_length=0.02, max_count=10000, num_samples=2, chain=False,
         )
         left = draw_segments(frames[0], raw.pixels, color=(255, 196, 32))

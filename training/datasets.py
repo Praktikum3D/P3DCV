@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 from training.camera_augmentation import DEFAULT_SUPERSAMPLE
 from training.dl3dv_dataset import DL3DVDataset
 from training.line_detection import DEFAULT_MAX_COUNT, DEFAULT_MIN_LENGTH, DEFAULT_NUM_SAMPLES
-from training.tartanair_dataset import TartanAirDataset
+from training.tartanair_dataset import DEFAULT_LINE_NATIVE_SIZE, TartanAirDataset
 
 
 def _get_section(config: edict, name: str) -> edict:
@@ -100,6 +100,8 @@ def build_dataset(config: edict, *, split: str) -> Dataset[Any]:
             line_max_count=int(dataset.get("line_max_count", DEFAULT_MAX_COUNT)),
             line_samples=int(dataset.get("line_samples", DEFAULT_NUM_SAMPLES)),
             line_chain=bool(dataset.get("line_chain", True)),
+            line_detect_native=bool(dataset.get("line_detect_native", True)),
+            line_native_size=int(dataset.get("line_native_size", DEFAULT_LINE_NATIVE_SIZE)),
         )
 
     raise ValueError(f"Unsupported config.dataset.name: {dataset_name!r}")
