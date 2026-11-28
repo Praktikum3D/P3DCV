@@ -55,3 +55,93 @@ for the [released code](https://github.com/QitaoZhao/E-RayZer/blob/4309c76/docs/
 averages, `summary.csv` with one row per scene and `sample_*` folders with
 predicted and target renders. PSNR per scene ranges from about 14 to 30, so
 compare models on the full split and not on a few scenes.
+
+## Comparing models on TartanAir
+
+`slurm/evaluate_model.sh` evaluates one checkpoint on one TartanAir
+environment, so several models can be put side by side on the same views.
+
+```bash
+sbatch --export=ALL,RUN_NAME=b90-fisheye-long,ENV_NAME=HongKong,MASK_OVERRIDE=circle \
+    slurm/evaluate_model.sh
+```
+
+A run under `checkpoints/runs/` brings its own `config.yaml`, which carries
+the camera settings it was trained with. The released `erayzer_multi.pt` has
+none, so it takes the repository config plus `CAMERA_MODEL`, `F_SCALE`,
+`NEAR`, `ALPHA_INIT`, `RENDERER` and `GEER_TILE_MODE`. The view selection is
+pinned in the script, so every model sees the same frames whatever curriculum
+its own config was trained with.
+
+### Scoring options
+
+| Option | Meaning |
+| --- | --- |
+| `evaluation.mask_override` | Unset scores every model on the mask its own training loss used. `circle` scores every model, pinhole included, on the circle spanning the image width without the 90 degree cap, which is what makes a pinhole model and a 195 degree fisheye model comparable |
+| `evaluation.sample_views` | Target view indices, for example `0,2,4`, written as `panel_<view>.png` with the real image next to the rendering |
+| `evaluation.novel_views` | How many poses halfway between the input poses, moved sideways by `evaluation.novel_offset` scene radii, to render as `novel_*.png`. They have no ground truth and carry no score, they show what the model does away from its input views |
+
+The circle mask is still intersected with the range the camera model itself
+is defined on. For a UCM camera that range shrinks with a large alpha and a
+short focal length, roughly below a focal length of half the image width times
+the square root of `2 alpha - 1`, and such a view would be scored on fewer
+pixels than the models it is compared against. At the values the b90 runs
+learned the circle survives untouched; when it does not, the job log says so
+and names the share of the circle that is missing.
+
+`metrics.txt` and `summary.csv` report `psnr` and `ssim` on the active mask,
+`psnr_unmasked` and `ssim_unmasked` on the whole frame, and `mask_fraction`,
+the share of pixels the mask covers. SSIM is the usual one, an 11 by 11
+Gaussian window with sigma 1.5 over a data range of 1, implemented in
+`erayzer_core/utils/image_metrics.py` because the container image carries
+neither torchmetrics nor skimage. LPIPS would need a package the image does
+not have, so it is not reported.
+
+## Cameras whose true parameters we know
+
+`slurm/camera_benchmark.sh` answers the question the camera work is measured
+by: given images of a camera the model is not told about, how close does it
+get to that camera. It resamples the 195 degree `lcam_fish` frames of one
+environment into a fixed list of test cameras and compares what the model
+predicts with what the camera really is.
+
+```bash
+sbatch --export=ALL,RUN_NAME=b90-ucm-long,ENV_NAME=HongKong slurm/camera_benchmark.sh
+sbatch --export=ALL,RUN_NAME=b90-ucm-long,ENV_NAME=HongKong,CAMERA_SET=front \
+    slurm/camera_benchmark.sh
+```
+
+The test cameras, fifteen of them, are fixed in `scripts/camera_benchmark.py`
+and contain no randomness at all.
+
+| Family | Field of view across the width | alpha |
+| --- | --- | --- |
+| Pinhole | 60, 90, 120 | 0 exactly |
+| Equidistant fisheye | 120, 150, 195 | the UCM fit of the true mapping, about 0.65, 0.64 and 0.62 |
+| UCM | 130, 160, 190 | 0.4, 0.62 and 0.8, every combination, all nine valid |
+
+`CAMERA_SET=front` drops the remap and scores the real `image_lcam_front.zip`
+of the same environment, a pinhole whose field of view the loader has always
+assumed to be 90 degrees across the width; `FRONT_FOV` overrides that.
+
+Two things make the numbers of two checkpoints comparable. The frames come
+from `SEED` alone, never from the checkpoint or the camera, and they are
+listed at the end of `summary.txt`. The scoring mask is a function of the
+test camera only, the remap validity inside the circle spanning the image
+width (`MASK=valid` keeps the corners of a narrow pinhole, `MASK=full` scores
+everything), so two models with very different predicted cameras are still
+scored on the same pixels.
+
+The output folder holds `cameras.csv` with one row per test camera,
+`summary.txt` with the same table plus the pass or fail of the five degree
+field of view criterion, and `panel_<family>.png` with the ground truth next
+to the rendering for every camera of one family. `BASELINE_CSV` points at the
+`cameras.csv` of another run and adds the difference to the summary.
+
+A sample whose metric came out NaN or infinite is left out of the mean, which
+keeps one diverged scene from erasing a whole row, but it would make an
+unstable checkpoint look better than a stable one. The columns `n_finite_fov`
+and `n_finite_psnr` therefore say how many samples each mean really rests on,
+and `summary.txt` carries a `WARNING` block naming every camera where that is
+below `n_samples`. A camera that fails on all of its samples still fails the
+criterion.
