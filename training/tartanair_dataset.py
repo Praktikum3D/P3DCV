@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -17,10 +18,51 @@ from torch.utils.data import Dataset
 from training.camera_augmentation import (
     DEFAULT_SUPERSAMPLE,
     FISH_SIZE,
+    IDENTITY_FISHEYE,
+    AugCamera,
+    map_fisheye_pixels,
     normalize_mix,
     remap_views,
     sample_camera,
 )
+from training.line_detection import (
+    DEFAULT_MAX_COUNT,
+    DEFAULT_MIN_LENGTH,
+    DEFAULT_NUM_SAMPLES,
+    PAD_VALUE,
+    detect_line_segments,
+    detect_lines_in_views,
+    image_circle_mask,
+    resolve_min_length,
+)
+
+DEFAULT_LINE_NATIVE_SIZE = 512
+"""Side the source frame is resized to before lines are detected on it, 0 for the full 1000.
+
+Lines are detected on the source frame and mapped into the training view (see `_detect_lines`), so
+this is the resolution that decides how accurate the detections are, independently of the 256 the
+model trains at. It matters more than anything else in this module. Measured over eight
+`data-sample` frames, mapped down to a 256 pixel view, at the operating point the current model
+actually sits at (field of view 188 degrees instead of 195, so f at 1.0372 times the true one):
+
+    detect at             256      384      512      768     1000
+    gradient at 1.0372   AWAY  towards  towards  towards  towards
+    residual x1.4 / x1.0  2.3      4.7      6.8     16.9     32.3
+    ms per frame           81      154      248      526     1120
+
+(end to end per frame, so decode and resize included; a busy frame costs several times a sparse
+one. `tests/test_line_infra.py::test_the_native_path_is_sharper_on_real_frames` pins the sign of
+the gradient at the operating point through the loader itself.)
+
+Detecting on the 256 pixel view, which is what the model sees, is worse than useless: the
+detector's endpoint noise is a fixed fraction of a pixel, so in angle it grows as the image
+shrinks, and at 256 it buries the signal so thoroughly that the residual at the current operating
+point is LOWER than at the true camera and its gradient pushes the field of view further away from
+195 degrees. A line loss built on 256 pixel detections would work against the thing it is meant to
+fix. 512 is the smallest size with a clear margin on the right side of that, at about five times
+the cost of 256; 0 is sharper again at five times the cost of 512 and is the right setting for the
+initialiser and the per scene refinement, which run on a handful of frames and do not care.
+"""
 
 # TartanAir NED body axes (x forward, y right, z down) -> OpenCV camera axes (x right, y down, z forward).
 _R_CV_FROM_NED = np.array(
@@ -192,6 +234,14 @@ class TartanAirDataset(Dataset):
         camera_augmentation: bool = False,
         camera_aug_mix: Optional[Dict[str, float]] = None,
         camera_aug_supersample: int = DEFAULT_SUPERSAMPLE,
+        detect_lines: bool = False,
+        line_detector: str = "auto",
+        line_min_length: float = DEFAULT_MIN_LENGTH,
+        line_max_count: int = DEFAULT_MAX_COUNT,
+        line_samples: int = DEFAULT_NUM_SAMPLES,
+        line_chain: bool = True,
+        line_detect_native: bool = True,
+        line_native_size: int = DEFAULT_LINE_NATIVE_SIZE,
     ) -> None:
         self.dataset_path = os.path.abspath(os.path.expanduser(dataset_path))
         self.camera_name = camera_name
@@ -208,6 +258,19 @@ class TartanAirDataset(Dataset):
                 "dataset.camera_augmentation needs a fisheye source, set dataset.camera_name to "
                 f"lcam_fish (got {self.camera_name!r})"
             )
+
+        # Line detection: find straight segments on the image the model will actually see, so the
+        # plumb line residual can be evaluated on them later. Default off, and off means not one
+        # line of this runs; see `training/line_detection.py` for what a straight segment means on
+        # a wide angle image.
+        self.detect_lines = bool(detect_lines)
+        self.line_detector = str(line_detector)
+        self.line_min_length = float(line_min_length)
+        self.line_max_count = max(1, int(line_max_count))
+        self.line_samples = max(1, int(line_samples))
+        self.line_chain = bool(line_chain)
+        self.line_detect_native = bool(line_detect_native)
+        self.line_native_size = max(0, int(line_native_size))
 
         self.trajectories = _discover_trajectories(self.dataset_path, camera_name=camera_name)
 
@@ -227,6 +290,15 @@ class TartanAirDataset(Dataset):
         # Open ZipFile handles lazily per worker process (ZipFile is not fork/pickle safe).
         self._zip_cache: Dict[Tuple[int, str], zipfile.ZipFile] = {}
         self._pose_cache: Dict[int, np.ndarray] = {}
+
+    @property
+    def _is_fisheye_source(self) -> bool:
+        """Whether the frames are full frame fisheye, so their corners carry no data.
+
+        The same guess `loss_render_mask` makes from the dataset name, and no better: it is right
+        as long as a `fish` dataset really delivers full `lcam_fish` frames.
+        """
+        return "fish" in str(self.camera_name or "")
 
     def __len__(self) -> int:
         return len(self.trajectories) * self.data_repeat
@@ -285,9 +357,19 @@ class TartanAirDataset(Dataset):
         return array
 
     def _load_image_and_intrinsics(
-        self, record: _TrajectoryRecord, frame_idx: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self, record: _TrajectoryRecord, frame_idx: int, keep_native: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[np.ndarray]]:
+        """The resized view and its intrinsics, plus the frame at its stored size on request.
+
+        `keep_native` hands back the decoded frame before the resize, for the line detection, and
+        only when it is a square `lcam_fish` frame, because only then is the resize a pure scale and
+        `map_fisheye_pixels` able to place its pixels in the view. It costs one array copy of an
+        image that is decoded anyway, never a second decode.
+        """
         image = self._open_image(record, frame_idx)
+        native = None
+        if keep_native and image.size[0] == image.size[1] == FISH_SIZE:
+            native = np.asarray(image, dtype=np.uint8)
 
         width, height = image.size
         # TartanAir-V2 pinhole (90 deg FoV): fx = fy = W/2, cx = W/2, cy = H/2.
@@ -333,11 +415,11 @@ class TartanAirDataset(Dataset):
 
         array = np.asarray(image, dtype=np.float32) / 255.0
         tensor = torch.from_numpy(array).permute(2, 0, 1).contiguous()
-        return tensor, intr
+        return tensor, intr, native
 
     def _augmented_views(
         self, record: _TrajectoryRecord, indices: Sequence[int]
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], AugCamera, List[np.ndarray]]:
         """Draw one camera and resample all views of this sample to it.
 
         One camera for the whole sample, never one per view: the views of a sample are meant to show
@@ -346,8 +428,9 @@ class TartanAirDataset(Dataset):
         The draw hangs off the `random` module, which the data loader seeds per worker and per epoch,
         so a fixed global seed reproduces the cameras exactly.
 
-        Returns the images, the per view intrinsics and the extra batch fields `data_mask`,
-        `aug_fov_true`, `aug_alpha_true` and `aug_model`.
+        Returns the images, the per view intrinsics, the extra batch fields `data_mask`,
+        `aug_fov_true`, `aug_alpha_true` and `aug_model`, and, for the line detection, the drawn
+        camera and the source frames it was drawn from.
         """
         rng = np.random.default_rng(random.getrandbits(63))
         camera = sample_camera(rng, self.camera_aug_mix)
@@ -364,7 +447,121 @@ class TartanAirDataset(Dataset):
             "aug_alpha_true": torch.tensor(float(alpha_true), dtype=torch.float32),
             "aug_model": torch.tensor(camera.code, dtype=torch.long),
         }
-        return images, intrinsics, extra
+        return images, intrinsics, extra, camera, frames
+
+    def _detect_lines(
+        self,
+        images: torch.Tensor,
+        data_mask: Optional[torch.Tensor],
+        native_frames: Optional[List[np.ndarray]],
+        camera: AugCamera,
+    ) -> Dict[str, torch.Tensor]:
+        """Lines of every view of this sample, in the pixels of the view, padded into batch tensors.
+
+        Two ways to get there, and which one is used matters more than anything else here.
+
+        With `native_frames` (the default where they can be loaded) the detector runs on the sharp
+        `lcam_fish` source frame and the pixels it finds are mapped into the view analytically by
+        `map_fisheye_pixels`: unproject with the known equidistant source law, reproject with the
+        drawn camera. The lines then sit in exactly the pixels of the image the model sees, which is
+        what the residual needs, but they carry the subpixel accuracy of the source rather than of a
+        256 pixel thumbnail. Without them, the detector runs on the view itself, which is honest but
+        so noisy at 256 pixels that the residual turns adversarial; see DEFAULT_LINE_NATIVE_SIZE for
+        the numbers and `line_detect_native` to force it.
+
+        Either way the border of the data is kept out. On the source that is the fisheye image
+        circle, whose rim is a long smooth arc belonging to no 3D line; on an augmented view it is
+        the sample's own `data_mask`; on an unaugmented view it is the image circle again, which is
+        what `loss_render_mask` assumes of a `fish` dataset too.
+
+        Every view is detected, not only the input views. The split into input and target views is
+        drawn in the model (`ERayZer._split_indices`), not here, so the loader cannot know which
+        views will be inputs; the consumer picks its views out of the per view tensors with the same
+        index it uses for the images.
+
+        Returns `line_pixels` [v, line_max_count, line_samples, 2] float32, padded with -1, and
+        `line_count` [v] int64, the number of real lines of each view. The padded width is the fixed
+        knob and not the largest count found, so that the default collate can stack samples.
+        """
+        if native_frames is not None:
+            return self._detect_lines_on_source(images, data_mask, native_frames, camera)
+
+        views = [images[i] for i in range(images.shape[0])]
+        if data_mask is not None:
+            masks: Optional[List] = [data_mask[i] for i in range(data_mask.shape[0])]
+        elif self._is_fisheye_source:
+            circle = torch.from_numpy(image_circle_mask(images.shape[-1]))
+            masks = [circle] * len(views)
+        else:
+            masks = None
+        pixels, counts = detect_lines_in_views(
+            views,
+            masks=masks,
+            min_length=self.line_min_length,
+            max_count=self.line_max_count,
+            num_samples=self.line_samples,
+            detector=self.line_detector,
+            chain=self.line_chain,
+        )
+        return {"line_pixels": pixels, "line_count": counts}
+
+    def _detect_lines_on_source(
+        self,
+        images: torch.Tensor,
+        data_mask: Optional[torch.Tensor],
+        native_frames: List[np.ndarray],
+        camera: AugCamera,
+    ) -> Dict[str, torch.Tensor]:
+        """Detect on the `lcam_fish` source frames and map the pixels into the view."""
+        size = int(images.shape[-1])
+        source_size = int(native_frames[0].shape[0])
+        if self.line_native_size and self.line_native_size < source_size:
+            source_size = self.line_native_size
+        circle = image_circle_mask(source_size)
+        min_px = resolve_min_length(self.line_min_length, (size, size))
+
+        pixels = torch.full(
+            (len(native_frames), self.line_max_count, self.line_samples, 2), PAD_VALUE, dtype=torch.float32
+        )
+        counts = torch.zeros(len(native_frames), dtype=torch.long)
+        for view, frame in enumerate(native_frames):
+            if frame.shape[0] != source_size:
+                frame = cv2.resize(frame, (source_size, source_size), interpolation=cv2.INTER_AREA)
+            # The length cut waits until the pixels are in the view: a line that is short on the
+            # 195 degree source can fill a narrow drawn camera, and one that is long there can fall
+            # outside it entirely. Generous limits here, the real ones are applied after the map.
+            found = detect_line_segments(
+                frame,
+                mask=circle,
+                min_length=0.05,
+                max_count=8 * self.line_max_count,
+                num_samples=self.line_samples,
+                detector=self.line_detector,
+                chain=self.line_chain,
+            )
+            if len(found) == 0:
+                continue
+
+            mapped, valid = map_fisheye_pixels(found.pixels, camera, size, source_size)
+            keep = valid.all(axis=-1)  # every sampled pixel of the line has to be imaged
+            if data_mask is not None and keep.any():
+                mask = data_mask[view, 0] > 0.5
+                columns = np.clip(np.round(mapped[..., 0] - 0.5).astype(np.int64), 0, size - 1)
+                rows = np.clip(np.round(mapped[..., 1] - 0.5).astype(np.int64), 0, size - 1)
+                # The drawn cameras all have a convex valid region, so the sampled pixels decide.
+                keep &= mask.numpy()[rows, columns].all(axis=-1)
+            mapped = mapped[keep]
+            if len(mapped) == 0:
+                continue
+
+            length = np.linalg.norm(np.diff(mapped, axis=1), axis=-1).sum(axis=-1)
+            order = np.argsort(-length)[: self.line_max_count]
+            order = order[length[order] >= min_px]
+            if len(order) == 0:
+                continue
+            counts[view] = len(order)
+            pixels[view, : len(order)] = torch.from_numpy(np.ascontiguousarray(mapped[order]))
+        return {"line_pixels": pixels, "line_count": counts}
 
     def _select_views(self, num_frames: int) -> List[int]:
         if num_frames < self.num_views:
@@ -440,17 +637,32 @@ class TartanAirDataset(Dataset):
             scene_indices = torch.full_like(image_indices, traj_idx)
 
             extra: Dict[str, torch.Tensor] = {}
+            camera = IDENTITY_FISHEYE
+            native_frames: Optional[List[np.ndarray]] = None
+            # The source frames are only worth keeping when the line detection will read them; see
+            # `_detect_lines`. They are the full 1000 x 1000 images, so holding them otherwise would
+            # cost every worker three megabytes a view for nothing.
+            keep_native = self.detect_lines and self.line_detect_native and self._is_fisheye_source
             if self.camera_augmentation:
-                stacked_images, stacked_intr, extra = self._augmented_views(record, indices)
+                stacked_images, stacked_intr, extra, camera, frames = self._augmented_views(record, indices)
+                native_frames = frames if keep_native else None
             else:
                 images: List[torch.Tensor] = []
                 intrinsics: List[torch.Tensor] = []
+                natives: List[np.ndarray] = []
                 for frame_idx in indices:
-                    img, intr = self._load_image_and_intrinsics(record, frame_idx)
+                    img, intr, native = self._load_image_and_intrinsics(record, frame_idx, keep_native)
                     images.append(img)
                     intrinsics.append(intr)
+                    if native is not None:
+                        natives.append(native)
                 stacked_images = torch.stack(images, dim=0)
                 stacked_intr = torch.stack(intrinsics, dim=0)
+                native_frames = natives if len(natives) == len(indices) else None
+
+            if self.detect_lines:
+                extra.update(self._detect_lines(stacked_images, extra.get("data_mask"),
+                                                native_frames, camera))
 
             return {
                 "image": stacked_images,
