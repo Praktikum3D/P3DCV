@@ -315,52 +315,107 @@ def plumbline_loss(result: edict, config: edict) -> torch.Tensor:
 
     The lines come off `result.input_line_pixels`, which the model gathered with the same `input_idx`
     it gathered the images with, and the intrinsics off `result.fxfycxcy_input`, before any detach,
-    normalised by the image size exactly as `cam_info_to_plucker` receives them. Both tensors are
-    cast to float32: the eigenvalue math behind the residual reads ratios of small numbers and bf16
-    autocast would turn them into noise.
+    normalised by the image size exactly as `cam_info_to_plucker` receives them.
+
+    Autocast has to be switched OFF, not just cast away
+    ---------------------------------------------------
+    `compute_loss` runs inside the training step's `torch.autocast`, and autocast is not a property
+    of the tensors, it is a property of the operation: it re-casts the inputs of every einsum it
+    sees back to bf16, so calling `.float()` on the arguments achieves nothing at all. The residual
+    is a ratio of two eigenvalues of a scatter matrix whose off plane part is the small difference
+    of large nearly equal numbers, which is exactly the quantity bf16's eight mantissa bits destroy.
+    Measured on synthetic coplanar lines, residual at the camera that produced them:
+
+        float32                4.3e-8
+        inside bf16 autocast   7.9e-4
+
+    That noise floor is fourteen times the signal this term carries on real data (about 5.5e-5), it
+    is NOT a constant offset, and it inverts: under autocast the residual came out LOWER at a wrong
+    camera than at the right one and the focal length gradient at f times 1.25 pointed away from the
+    truth. A line loss built like that would inject noise with a wrong sign into the camera heads,
+    which is worse than no term at all. So the whole evaluation runs inside an explicit
+    `torch.autocast(..., enabled=False)` block, and `tests/test_line_opt.py` pins it by running this
+    function under bf16 autocast and checking both the floor and the gradient sign.
+
+    That guard covers the forward only. Autograd replays the recorded nodes under whatever autocast
+    context is active when `backward` is called, so a backward taken INSIDE an autocast block runs
+    these einsums in bf16 after all, measurably: the focal length gradient at f times 0.8 comes out
+    +2.8e-4 on the cpu where it should be -2.0e-3, with the sign flipped. `main` already takes its
+    backward outside the `with autocast_ctx` block, which is what makes the term sound in the real
+    training step, and a test pins that placement so a refactor cannot quietly undo it.
+
+    Trimmed per sample, not per batch
+    ---------------------------------
+    `plumbline_residual_mean` trims the worst lines over all its leading dimensions at once, which
+    across a batch means the worst lines of the WORST sample go first. That is backwards: the sample
+    whose predicted camera is furthest off is the one whose lines score highest, so a global trim
+    silences precisely the gradient the term exists to deliver. Each sample is therefore trimmed and
+    averaged on its own and the scalars are averaged afterwards, which leaves every sample with the
+    same weight whatever its camera is doing. Within one sample the trim still does its job of
+    dropping the chains that joined two different objects.
 
     A pinhole `model.camera_model` is a degenerate case worth naming: the rays of ANY set of
     collinear pixels are coplanar under a pinhole camera, so the residual is zero whatever the focal
     length is and this term teaches nothing. It stays switched on for pinhole only because turning it
     into an error would be a surprise in a sweep; the number it logs is the honest zero.
 
-    The detection resolution decides whether this term helps or hurts
-    ----------------------------------------------------------------
-    `dataset.line_native_size` is not a detail, it is the setting the term stands or falls with, and
-    with camera augmentation the dataset's own default of 512 is NOT enough. Measured over twelve
-    augmented samples from `data-sample`, perturbing the focal length to 1.0372 times the drawn one
+    The detection resolution decides whether this term helps or hurts, and how much
+    -------------------------------------------------------------------------------
+    `dataset.line_native_size` is the setting the term stands or falls with. Measured over 32
+    augmented samples from `data-sample`, ten views each with the five input views scored exactly as
+    this function scores them, float32, perturbing the focal length to 1.0372 times the drawn one
     (the 188 degrees instead of 195 the trained model sits at) and asking which way the residual
-    then wants to move it:
+    then wants to move it. "Wider" is the right answer:
 
-        line_native_size            256     512     768       0 (1000)
-        points to a wider camera   1/12    1/12   10/12        8/12
-        of the drawn cameras wider than 150 degrees
-                                    0/6     0/6     6/6         6/6
-        mean residual at 1.0372  2.1e-4  1.2e-4  5.5e-5      4.3e-5
-        ms per sample (4 views)     463    1083    2125        4492
+        line_native_size              256      512      768   0 (1000)
+        points wider, all samples   10/32    14/32    23/32      27/32
+        drawn camera above 150 deg   0/14     4/14     9/14      11/14
+        drawn camera above 180 deg    0/4      3/4      3/4        3/4
+        mean residual at 1.0372    2.0e-4   8.8e-5   5.7e-5     3.4e-5
+        seconds per sample, 10 views  1.1      2.9      5.8       14.9
 
-    At 512 the term would push the field of view further from 195 degrees on nearly every sample,
-    which is the opposite of what it is for. From 768 on it points the right way on every wide
-    camera, and the narrow ones (below 150 degrees, where a line is almost straight in the image and
-    carries little curvature) stay close to indifferent. So a sieve run wants
-    `-s dataset.line_native_size 768` and enough workers to pay for it. The same measurement on
-    UNAUGMENTED full frames came out in favour of 512 (`training/tartanair_dataset.py`); the
-    augmentation resamples the view and costs the detection a step of sharpness on top.
+    Read it honestly. At 256 the term is adversarial, 0 of 14 wide cameras: a line loss built on it
+    would push the field of view AWAY from 195 degrees, which is the failure it is meant to fix. The
+    dataset's default of 512 is barely better than a coin toss on the wide cameras, 4 of 14. Only
+    from 768 does the majority point the right way, and even there it is 9 of 14, not a clean
+    signal; the full 1000 reaches 11 of 14 at two and a half times the cost. So a sieve run wants at
+    least `-s dataset.line_native_size 768` and enough workers to pay for it, and a null result from
+    that run should be read as "the signal at this operating point is weak", not as "the loss is
+    broken".
+
+    An earlier version of this table, over 12 samples of 4 views, reported 10/12 and 6/6 at 768. The
+    numbers above supersede it: a reviewer's independent reproduction on different frames came out
+    near 4/8, the pooled measurement lands between the two, and the small sample was luck. The scene
+    diversity here is 16 frames of one environment, so what is really varying is the drawn camera.
+
+    A last contrast worth keeping: on UNAUGMENTED full frames the same measurement favoured 512
+    (`training/tartanair_dataset.py`). The augmentation resamples the view and costs the detection a
+    step of sharpness on top of everything else.
     """
     weight = float(config.training.get("line_loss_weight", 0.0))
     if weight <= 0.0 or "input_line_pixels" not in result:
         return None
-    pixels = result.input_line_pixels.float()                       # [b, v_input, n_max, K, 2]
-    intrinsics = result.fxfycxcy_input.float()[:, :, None, :]       # [b, v_input, 1, d], one per line
+    pixels = result.input_line_pixels                               # [b, v_input, n_max, K, 2]
+    intrinsics = result.fxfycxcy_input                              # [b, v_input, d]
     h, w = result.image.shape[-2:]
-    return plumbline_residual_mean(
-        intrinsics,
-        config.model.get("camera_model", "pinhole"),
-        pixels,
-        (int(h), int(w)),
-        normalized_intrinsics=True,
-        trim=float(config.training.get("line_loss_trim", DEFAULT_TRIM)),
-    )
+    camera_model = config.model.get("camera_model", "pinhole")
+    trim = float(config.training.get("line_loss_trim", DEFAULT_TRIM))
+
+    with torch.autocast(device_type=pixels.device.type, enabled=False):
+        pixels = pixels.float()
+        intrinsics = intrinsics.float()[:, :, None, :]              # [b, v_input, 1, d], one per line
+        per_sample = [
+            plumbline_residual_mean(
+                intrinsics[i],
+                camera_model,
+                pixels[i],
+                (int(h), int(w)),
+                normalized_intrinsics=True,
+                trim=trim,
+            )
+            for i in range(pixels.shape[0])
+        ]
+        return torch.stack(per_sample).mean()
 
 
 def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, loss_modules: edict) -> edict:

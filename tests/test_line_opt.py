@@ -221,6 +221,147 @@ def test_the_weight_scales_the_contribution_and_nothing_else():
 
 
 # --------------------------------------------------------------------------------------------
+# autocast, which is the one thing that silently turns this term into noise
+# --------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_the_residual_survives_bf16_autocast(device):
+    """`compute_loss` runs inside the training step's autocast, and autocast re-casts einsum inputs.
+
+    Casting the arguments to float32 does not help, because autocast is a property of the operation
+    and not of the tensor. Left unguarded the residual at the true camera comes out around 1.8e-3,
+    a noise floor far above the roughly 5e-5 of real signal; guarded it is the float32 value. The
+    naive number is measured here as well, so this test cannot quietly become vacuous if a future
+    torch stops casting einsum.
+    """
+    intrinsics = torch.tensor([300.0, 300.0, 500.0, 500.0], device=device)
+    pixels = synthetic_line_pixels(intrinsics.double().cpu(), "fisheye").float().to(device)
+    from training.line_geometry import plumbline_residual_mean as residual_mean
+
+    clean = float(residual_mean(intrinsics, "fisheye", pixels))
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        naive = float(residual_mean(intrinsics, "fisheye", pixels))
+        with torch.autocast(device_type=device, enabled=False):
+            guarded = float(residual_mean(intrinsics.float(), "fisheye", pixels.float()))
+    assert naive > 100.0 * max(clean, 1e-12), "autocast no longer degrades the residual, rewrite this test"
+    assert guarded == clean
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_the_loss_keeps_its_floor_and_its_sign_under_autocast(device):
+    """The regression test for the blocker: `plumbline_loss` called exactly as training calls it.
+
+    Two things have to hold inside bf16 autocast. The residual at the camera that produced the
+    pixels stays at a float32 floor, four orders below the signal on real data. And the focal length
+    gradient at f times 1.25 still points back down towards the truth, which it did NOT before the
+    guard: under autocast the wrong camera scored lower than the right one and the sign flipped.
+    """
+    result, _ = loss_inputs(camera_model="fisheye")
+    true_camera_lines(result, "fisheye", v=3)  # on the CPU, where the double precision projection is
+    for key in ("render", "image", "target_image", "fxfycxcy_input", "input_line_pixels"):
+        result[key] = result[key].to(device)
+    truth = result.fxfycxcy_input.clone()
+    config = loss_config("fisheye", 1.0)
+
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        at_truth = float(train.plumbline_loss(result, config))
+    assert at_truth < 1e-6, f"autocast noise floor is back: {at_truth}"
+
+    for factor in (0.8, 1.25):
+        result.fxfycxcy_input = (
+            truth * torch.tensor([factor, factor, 1.0, 1.0], device=device)
+        ).requires_grad_(True)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            wrong = train.plumbline_loss(result, config)
+        assert float(wrong) > 100.0 * at_truth, f"x{factor} must cost more, not less"
+        # Outside the autocast block, which is where train.py takes its backward; the test below
+        # pins that it still does, because inside it the gradient is wrong on both devices.
+        wrong.backward()
+        slope = float(result.fxfycxcy_input.grad[..., 0].sum())
+        assert slope * (factor - 1.0) > 0.0, f"x{factor}: gradient points away, {slope}"
+
+        plain = (truth * torch.tensor([factor, factor, 1.0, 1.0], device=device)).requires_grad_(True)
+        bare = edict({**result, "fxfycxcy_input": plain})
+        train.plumbline_loss(bare, config).backward()
+        assert torch.allclose(result.fxfycxcy_input.grad, plain.grad, rtol=1e-5, atol=1e-12), (
+            f"x{factor}: autocast changed the gradient"
+        )
+
+
+def test_the_training_step_takes_its_backward_outside_autocast():
+    """The other half of the blocker, and the half that cannot live inside `plumbline_loss`.
+
+    Disabling autocast around the forward does not disable it around the backward: autograd replays
+    the recorded nodes under whatever context is active when `backward` is called, so a backward
+    taken inside an autocast block runs those einsums in bf16 after all. Measured on the synthetic
+    lines, focal length gradient at f times 0.8, where it has to be negative:
+
+        backward outside autocast   -2.05e-3 on cpu, -2.05e-3 on cuda   (equals the float32 value)
+        backward inside autocast    +2.81e-4 on cpu, -1.83e-3 on cuda   (sign flipped on cpu)
+
+    `train.main` already dedents the backward out of the `with autocast_ctx` block, which is why
+    this works at all. It is pinned here because nothing else in the file says it matters.
+    """
+    source = inspect.getsource(train.main)
+    expected = (
+        "                with autocast_ctx:\n"
+        "                    result = model(batch, iter=step)\n"
+        "                    metrics = compute_loss(result, batch, config, loss_modules)\n"
+        "                    loss = metrics.loss / grad_accum\n"
+        "                scaler.scale(loss).backward()\n"
+    )
+    assert expected in source, "the backward moved relative to the autocast block"
+
+
+def test_the_loss_runs_the_residual_outside_autocast():
+    """Source level, so the guard cannot be removed by a refactor that still passes the numbers."""
+    source = inspect.getsource(train.plumbline_loss)
+    assert "torch.autocast(device_type=pixels.device.type, enabled=False)" in source
+    body = source[source.index("weight = float("):]
+    assert body.index("torch.autocast") < body.index("plumbline_residual_mean")
+
+
+# --------------------------------------------------------------------------------------------
+# the trim, which must not let one sample silence another
+# --------------------------------------------------------------------------------------------
+
+def test_each_sample_is_trimmed_on_its_own():
+    """A batch of two cameras, one right and one badly wrong, averaged with equal weight.
+
+    `plumbline_residual_mean` trims over all its leading dimensions at once, so across a batch the
+    worst lines of the WORST sample go first and the sample that needs correcting is the one being
+    silenced. The loss therefore trims each sample separately; this pins that the result is the
+    plain mean of the two per sample numbers and not the global trimmed mean.
+    """
+    from training.line_geometry import plumbline_residual_mean as residual_mean
+
+    right, _ = loss_inputs(camera_model="fisheye")
+    true_camera_lines(right, "fisheye", v=3)
+    pixels = right.input_line_pixels[0]                     # [v, n_max, K, 2]
+    k_true = right.fxfycxcy_input[0]                        # [v, d], normalized
+    k_wrong = k_true * torch.tensor([1.3, 1.3, 1.0, 1.0])
+
+    batched, _ = loss_inputs(camera_model="fisheye")
+    batched.input_line_pixels = torch.stack([pixels, pixels])
+    batched.fxfycxcy_input = torch.stack([k_true, k_wrong])
+    got = float(train.plumbline_loss(batched, loss_config("fisheye", 1.0)))
+
+    hw = (int(batched.image.shape[-2]), int(batched.image.shape[-1]))
+    per_sample = [
+        float(residual_mean(k[:, None, :], "fisheye", pixels, hw, normalized_intrinsics=True))
+        for k in (k_true, k_wrong)
+    ]
+    assert got == pytest.approx(sum(per_sample) / 2.0, rel=1e-6)
+
+    global_trim = float(residual_mean(
+        batched.fxfycxcy_input[:, :, None, :], "fisheye", batched.input_line_pixels, hw,
+        normalized_intrinsics=True,
+    ))
+    # and the two really are different, or the test would prove nothing
+    assert abs(got - global_trim) > 0.1 * got
+
+
+# --------------------------------------------------------------------------------------------
 # degenerate batches
 # --------------------------------------------------------------------------------------------
 
@@ -383,7 +524,7 @@ def test_camera_offsets_keep_alpha_inside_its_range():
 
 
 def test_alpha_can_be_frozen():
-    """Refining f alone is a supported mode, because f and alpha are coupled under few lines."""
+    """Refining f alone is the DEFAULT mode, because f and alpha trade off against each other."""
     k = torch.tensor(UCM, dtype=torch.float32).repeat(2, 1)
     frozen = CameraOffsets(k, "ucm", learn_alpha=False)
     assert frozen.alpha_offset is None
@@ -398,6 +539,27 @@ def test_beta_moves_only_when_it_is_asked_to():
     assert [name for name, _ in frozen.named_parameters()] == ["log_f", "alpha_offset"]
     learning = CameraOffsets(k, "eucm", learn_beta=True)
     assert "log_beta" in dict(learning.named_parameters())
+
+
+def test_the_focal_trust_region_stops_a_runaway():
+    """The clamp is on the offset, so a wild step pins f at the boundary instead of drifting on."""
+    k = torch.tensor(FISHEYE, dtype=torch.float32).repeat(3, 1)
+    offsets = CameraOffsets(k, "fisheye", log_f_limit=0.5)
+    with torch.no_grad():
+        offsets.log_f.fill_(5.0)
+    assert float(offsets()[0, 0]) == pytest.approx(float(k[0, 0]) * math.exp(0.5), rel=1e-5)
+    with torch.no_grad():
+        offsets.log_f.fill_(-5.0)
+    assert float(offsets()[0, 0]) == pytest.approx(float(k[0, 0]) * math.exp(-0.5), rel=1e-5)
+    # and the default clears the largest correction the local demonstration needed, a factor 0.504
+    loose = CameraOffsets(k, "fisheye")
+    with torch.no_grad():
+        loose.log_f.fill_(math.log(0.504))
+    assert float(loose()[0, 0]) == pytest.approx(float(k[0, 0]) * 0.504, rel=1e-5)
+    off = CameraOffsets(k, "fisheye", log_f_limit=0.0)
+    with torch.no_grad():
+        off.log_f.fill_(3.0)
+    assert float(off()[0, 0]) > float(k[0, 0]) * 10.0
 
 
 def test_scaling_the_intrinsics_leaves_alpha_alone():
@@ -539,9 +701,27 @@ def test_the_ucm_alpha_is_refined_too():
     scene = tiny_scene(camera_model="ucm")
     truth = float(scene.fxfycxcy[0, 4])
     start = perturbed(scene, 1.0, alpha=0.3)
-    result = refine_camera(start, steps=80, lr=0.05, line_weight=0.0)
+    result = refine_camera(start, steps=80, lr=0.05, line_weight=0.0, learn_alpha=True)
     got = float(result.fxfycxcy[0, 4])
     assert abs(got - truth) < abs(0.3 - truth), f"alpha {got} did not move towards {truth}"
+
+
+@needs_cuda
+def test_too_few_lines_freeze_alpha_and_say_so():
+    """The gate against the measured UCM runaway: two lines cannot pin f and alpha at once."""
+    scene = tiny_scene(camera_model="ucm")
+    one_line = torch.full((scene.c2w.shape[0], 4, 8, 2), PAD_VALUE, device=scene.device)
+    one_line[0, 0] = synthetic_line_pixels(scene.fxfycxcy[0].double().cpu(), "ucm")[0].to(scene.device)
+    result = refine_camera(scene, line_pixels=one_line, steps=5, image_weight=0.0, line_weight=1.0,
+                           learn_alpha=True)
+    assert result.num_lines == 1
+    assert result.alpha_frozen_by_gate
+    assert float(result.fxfycxcy[0, 4]) == pytest.approx(float(scene.fxfycxcy[0, 4]), rel=1e-6)
+    assert "alpha frozen" in result.summary()
+    # with the gate switched off the same scene is allowed to move alpha
+    loose = refine_camera(scene, line_pixels=one_line, steps=5, image_weight=0.0,
+                          line_weight=1.0, learn_alpha=True, min_lines_for_alpha=0)
+    assert not loose.alpha_frozen_by_gate
 
 
 @needs_cuda

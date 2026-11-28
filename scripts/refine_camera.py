@@ -25,24 +25,38 @@ with `--image-weight 0` to move the camera and read the photometric number as a 
 What is reported is the field of view and alpha before and after, which is what the weekend's five
 degree criterion is stated in.
 
-Measured locally, on the three scene files in `~/praktikum/scenes`, all dumped from checkpoints
-whose field of view had collapsed to around 90 degrees against a true 195, 200 steps each with
-`--image-weight 0` (see DEFAULT_LINE_WEIGHT in `training/camera_refine.py` for why):
+What it is worth, measured twice
+--------------------------------
+Far from the answer it is excellent. On scene files dumped from checkpoints whose field of view had
+COLLAPSED to around 90 degrees against a true 195, 200 steps each, lines only:
 
-    scene                     lines   fov before   fov after   error after
-    hongkong_b90_fisheye          5        97.1       192.7        2.3 deg
-    office_b90_fisheye           23        94.0       188.9        6.1 deg
-    hongkong_b90_ucm              2        90.0       232.6       37.6 deg
-    hongkong_b90_ucm, alpha frozen         90.0       197.3        2.3 deg
+    scene                            lines   fov before   fov after   error after
+    hongkong_b90_fisheye                 5        97.1       192.7        2.3 deg
+    office_b90_fisheye                  23        94.0       188.9        6.1 deg
+    hongkong_b90_ucm, alpha frozen       2        90.0       197.3        2.3 deg
+    hongkong_b90_ucm, alpha refined      2        90.0       232.6       37.6 deg
 
-Two things to take from that. The refinement really does find a 195 degree camera from a 90 degree
-one, from nothing but the curves in the image. And on a UCM scene with two free parameters and a
-handful of lines it overshoots instead: f and alpha trade off against each other over the few pixels
-that carry a constraint, and `--freeze-alpha` turns the same scene into the best result of the four.
-Short lines make it worse rather than better (`--min-line-length 0.1` gave 174 and 178 degrees on
-the two fisheye scenes against 193 and 189 with the default 0.2), which is the same selection effect
-`training/line_detection.py` describes: a short piece of a curve is nearly straight and nearly
-coplanar under any camera.
+Near the answer it is not. The same three scenes were re-dumped from the FINAL checkpoints while
+this was being written, so they now start at the operating point the trained model really sits at,
+about 191 degrees, and the same command does this:
+
+    scene                            lines   fov before   fov after   error 191 -> after
+    office_b90_fisheye                  26       190.5       194.2        4.5 -> 0.8 deg
+    hongkong_b90_fisheye                 7       190.5       188.2        4.5 -> 6.8 deg
+    hongkong_b90_ucm, alpha frozen      24       191.9       193.7        3.1 -> 1.3 deg
+    hongkong_b90_ucm, alpha refined     24       191.9       181.7        3.1 -> 13.3 deg
+
+(The first table cannot be reproduced any more, the files it used are gone. The second is what the
+current files give.) Two of three improve with alpha frozen, one gets worse by two degrees, and the
+average gain is small. That is the same picture the training side shows at this operating point: a
+correction of a hundred degrees is far above the noise, a correction of four degrees is not clearly
+above it.
+
+So: alpha is refined only with `--learn-alpha`, because on both dumps letting it move turned the
+best result into the worst one. Short lines hurt rather than help (`--min-line-length 0.1` gave 174
+and 178 degrees on the collapsed fisheye scenes against 193 and 189 with the default 0.2), which is
+the selection effect `training/line_detection.py` describes: a short piece of a curve is nearly
+straight and nearly coplanar under any camera.
 """
 
 from __future__ import annotations
@@ -64,7 +78,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training.camera_refine import (  # noqa: E402
     DEFAULT_DETECT_SIZE,
     DEFAULT_LINE_WEIGHT,
+    DEFAULT_LOG_F_LIMIT,
     DEFAULT_LR,
+    DEFAULT_MIN_LINES_FOR_ALPHA,
     DEFAULT_STEPS,
     RefineScene,
     detect_scene_lines,
@@ -255,8 +271,10 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--line-weight", type=float, default=DEFAULT_LINE_WEIGHT)
-    parser.add_argument("--image-weight", type=float, default=1.0,
-                        help="weight of the photometric term, 0 for a line only refinement")
+    parser.add_argument("--image-weight", type=float, default=0.0,
+                        help="weight of the photometric term, 0 (the default, and what the "
+                             "measurement recommends) for a line only refinement; the term anchors "
+                             "the camera where the network left it, see DEFAULT_LINE_WEIGHT")
     parser.add_argument("--auto-lambda", action="store_true",
                         help="set the line weight so both terms are equal at step 0")
     parser.add_argument("--no-lines", action="store_true", help="photometric term only, the control run")
@@ -265,8 +283,14 @@ def main() -> None:
     parser.add_argument("--min-line-length", type=float, default=0.2,
                         help="shortest line kept, a fraction of the image side below 1 and pixels above")
     parser.add_argument("--learn-beta", action="store_true", help="refine the EUCM beta as well")
-    parser.add_argument("--freeze-alpha", action="store_true",
-                        help="refine the focal length only, leaving the (E)UCM alpha where it was")
+    parser.add_argument("--learn-alpha", action="store_true",
+                        help="refine the (E)UCM alpha as well as the focal length; off by default "
+                             "because f and alpha trade off against each other and the measured "
+                             "result was worse, see refine_camera in training/camera_refine.py")
+    parser.add_argument("--min-lines-for-alpha", type=int, default=DEFAULT_MIN_LINES_FOR_ALPHA,
+                        help="below this many lines alpha is frozen automatically, 0 to never do it")
+    parser.add_argument("--log-f-limit", type=float, default=DEFAULT_LOG_F_LIMIT,
+                        help="trust region on the focal length in log units, 0 to switch it off")
     parser.add_argument("--true-fov", type=float, default=None,
                         help="the true field of view in degrees, to report the error against")
     parser.add_argument("--json", default=None, help="write the step history here")
@@ -307,8 +331,10 @@ def main() -> None:
         line_weight=args.line_weight,
         image_weight=args.image_weight,
         auto_lambda=args.auto_lambda,
-        learn_alpha=not args.freeze_alpha,
+        learn_alpha=args.learn_alpha,
         learn_beta=args.learn_beta,
+        min_lines_for_alpha=args.min_lines_for_alpha,
+        log_f_limit=args.log_f_limit,
         progress=args.progress or None,
     )
     print(f"{result.num_lines} lines used", flush=True)
@@ -331,6 +357,8 @@ def main() -> None:
                     "line_weight": args.line_weight,
                     "image_weight": args.image_weight,
                     "auto_lambda": bool(args.auto_lambda),
+                    "alpha_frozen_by_gate": bool(result.alpha_frozen_by_gate),
+                    "hit_focal_limit": bool(result.hit_focal_limit),
                     "history": result.history,
                 },
                 handle,

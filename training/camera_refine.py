@@ -94,6 +94,36 @@ an anchor to wherever the network left it. A refinement that is meant to move th
 with `image_weight=0` and keep the photometric number as a diagnostic.
 """
 
+DEFAULT_LOG_F_LIMIT = 1.0
+"""Trust region on the focal length: it may change by at most a factor exp(1) either way.
+
+A refinement has no business travelling further than that, and a run that tries is reporting a
+problem rather than a camera. The number is not tight on purpose. The correction this is actually
+built for, a field of view of 97 degrees pulled back to 195, is a factor 0.504, which is a log of
+-0.685, so a limit of 0.4 (one and a half times, the obvious safe looking choice) would have
+silently truncated the very result that shows the method works. One is the smallest round number
+that clears the largest correction seen so far with room to spare and still stops a runaway.
+
+It is a clamp on the offset, so hitting it pins the focal length at the boundary and the reported
+history shows a flat line there. Set it to 0 to switch the trust region off.
+
+It is also not the only way a refinement runs away, and in practice not the usual one: the UCM
+overshoots measured here went to 233 and to 182 degrees at focal length factors of 0.547 and 0.556,
+both well inside this limit, because what really moved was alpha. The guard for that one is to leave
+alpha frozen, which is what `refine_camera` now does by default.
+"""
+
+DEFAULT_MIN_LINES_FOR_ALPHA = 5
+"""Below this many detected lines, alpha is frozen even if the caller asked for it.
+
+A second line of defence only. The first is that `refine_camera` does not refine alpha unless asked,
+because the measurements there show the f alpha pair trading off against each other even with two
+dozen lines, which is well above any count a gate like this could sensibly use. This number catches
+the remaining case of a caller who turned alpha on and then met a scene where the detector found
+almost nothing: on `hongkong_b90_ucm` with two lines, alpha free gave 233 degrees against a true
+195 and alpha frozen gave 197.
+"""
+
 DEFAULT_DETECT_SIZE = 1024
 """Side the input views are rendered at for the line detection, 0 for the working resolution.
 
@@ -297,10 +327,11 @@ class CameraOffsets(torch.nn.Module):
     """
 
     def __init__(self, fxfycxcy: torch.Tensor, camera_model: str, learn_beta: bool = False,
-                 learn_alpha: bool = True):
+                 learn_alpha: bool = True, log_f_limit: float = DEFAULT_LOG_F_LIMIT):
         super().__init__()
         self.register_buffer("initial", fxfycxcy.detach().clone().float())
         self.camera_model = camera_model
+        self.log_f_limit = float(log_f_limit)
         self.log_f = torch.nn.Parameter(torch.zeros((), dtype=torch.float32))
         self.alpha_offset = None
         self.log_beta = None
@@ -312,9 +343,12 @@ class CameraOffsets(torch.nn.Module):
             self.log_beta = torch.nn.Parameter(torch.zeros((), dtype=torch.float32))
 
     def forward(self) -> torch.Tensor:
+        # The trust region, see DEFAULT_LOG_F_LIMIT. A clamp and not a penalty, so that a refinement
+        # which wants to run away stops at a reported boundary instead of drifting silently.
+        log_f = self.log_f if self.log_f_limit <= 0 else self.log_f.clamp(-self.log_f_limit, self.log_f_limit)
         columns = [
-            self.initial[..., 0] * torch.exp(self.log_f),
-            self.initial[..., 1] * torch.exp(self.log_f),
+            self.initial[..., 0] * torch.exp(log_f),
+            self.initial[..., 1] * torch.exp(log_f),
             self.initial[..., 2],
             self.initial[..., 3],
         ]
@@ -356,6 +390,8 @@ class RefineResult:
     camera_model: str
     history: List[Dict[str, float]] = field(default_factory=list)
     num_lines: int = 0
+    alpha_frozen_by_gate: bool = False
+    hit_focal_limit: bool = False
 
     @property
     def first(self) -> Dict[str, float]:
@@ -377,6 +413,10 @@ class RefineResult:
         )
         if "alpha" in a:
             text += f", alpha {a['alpha']:.4f} -> {b['alpha']:.4f}"
+        if self.alpha_frozen_by_gate:
+            text += f" (alpha frozen, only {self.num_lines} lines)"
+        if self.hit_focal_limit:
+            text += " (focal length stopped at the trust region)"
         return text
 
 
@@ -389,8 +429,10 @@ def refine_camera(
     line_weight: float = DEFAULT_LINE_WEIGHT,
     image_weight: float = 1.0,
     auto_lambda: bool = False,
-    learn_alpha: bool = True,
+    learn_alpha: bool = False,
     learn_beta: bool = False,
+    min_lines_for_alpha: int = DEFAULT_MIN_LINES_FOR_ALPHA,
+    log_f_limit: float = DEFAULT_LOG_F_LIMIT,
     trim: float = DEFAULT_TRIM,
     renderer: Optional[Renderer] = None,
     progress: Optional[int] = None,
@@ -403,20 +445,30 @@ def refine_camera(
     terms measured at step 0, so both start out exactly equal and the number is a measurement rather
     than a guess.
 
-    `learn_alpha` can be turned off to refine the focal length alone. That is worth having because
-    f and alpha are not independent under a few lines: several (f, alpha) pairs bend the rays almost
-    the same way over the pixels that were actually observed, so a scene with a handful of lines can
-    be better served by moving one parameter than two. The local demonstration in
-    `scripts/refine_camera.py` shows exactly that contrast.
+    Two guards keep an unsupervised run from reporting nonsense as a camera: `log_f_limit` is a
+    trust region on the focal length and `min_lines_for_alpha` freezes alpha on a scene with too few
+    lines to pin both. Both are reported on the result (`hit_focal_limit`, `alpha_frozen_by_gate`)
+    rather than applied quietly, so a sieve table can show which scenes were held back.
+
+    `learn_alpha` is OFF by default, which is a result and not a convenience. f and alpha bend the
+    rays in similar ways over the pixels a line set actually covers, so the pair is badly
+    conditioned and the optimizer trades one against the other. On `hongkong_b90_ucm` at the
+    operating point the trained model really sits at, 24 lines, field of view 191.9 against a true
+    195:
+
+        alpha refined too   191.9 -> 181.7 degrees, alpha 0.63 -> 0.34   (error 3.1 -> 13.3)
+        alpha frozen        191.9 -> 193.7 degrees, alpha unchanged      (error 3.1 ->  1.3)
+
+    The same scene dumped from an earlier, collapsed checkpoint behaved the same way, 233 degrees
+    with alpha free against 197 with it frozen. Two dozen lines are not few, so the line count gate
+    below does not catch this; only a deliberate decision does. Turn `learn_alpha` on when a scene
+    has enough geometry to support it and somebody is watching the result.
 
     Returns a `RefineResult` whose `history` holds, per step, the two terms, fx in pixels, the field
     of view in degrees and alpha where there is one. Nothing in the scene is modified.
     """
     height, width = scene.image_hw
     renderer = renderer_for(scene) if renderer is None else renderer
-    offsets = CameraOffsets(
-        scene.fxfycxcy, scene.camera_model, learn_beta=learn_beta, learn_alpha=learn_alpha
-    ).to(scene.device)
     target = scene.images.detach().float()
 
     # Frozen once, see the module docstring: the pixel set must not follow the camera.
@@ -431,6 +483,18 @@ def refine_camera(
     num_lines = int(valid_segment_mask(line_pixels).sum()) if line_pixels is not None else 0
     has_lines = num_lines > 0
 
+    # The conditioning gate, see DEFAULT_MIN_LINES_FOR_ALPHA. Reported rather than silent, because a
+    # scene that falls through it is a scene whose alpha nobody measured.
+    alpha_frozen_by_gate = (
+        learn_alpha and has_lines and min_lines_for_alpha > 0 and num_lines < int(min_lines_for_alpha)
+    )
+    if alpha_frozen_by_gate:
+        learn_alpha = False
+    offsets = CameraOffsets(
+        scene.fxfycxcy, scene.camera_model, learn_beta=learn_beta, learn_alpha=learn_alpha,
+        log_f_limit=log_f_limit,
+    ).to(scene.device)
+
     photometric = float(image_weight) != 0.0
 
     def terms(fxfycxcy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -441,9 +505,13 @@ def refine_camera(
             image = masked_image_loss(render, target, mask)
         if not has_lines:
             return image, fxfycxcy.new_zeros(())
-        residual = plumbline_residual_mean(
-            fxfycxcy[:, None, :], scene.camera_model, line_pixels, (height, width), trim=trim
-        )
+        # Belt and braces: a caller that wraps this in an autocast context would otherwise get the
+        # bf16 noise floor described in `train.plumbline_loss`, which is larger than the signal.
+        with torch.autocast(device_type=fxfycxcy.device.type, enabled=False):
+            residual = plumbline_residual_mean(
+                fxfycxcy.float()[:, None, :], scene.camera_model, line_pixels.float(),
+                (height, width), trim=trim,
+            )
         return image, residual
 
     optimizer = torch.optim.Adam(offsets.parameters(), lr=float(lr))
@@ -486,10 +554,13 @@ def refine_camera(
 
     with torch.no_grad():
         final = offsets().detach()
+        hit_limit = bool(log_f_limit > 0 and float(offsets.log_f.abs()) >= float(log_f_limit) - 1e-6)
     return RefineResult(
         fxfycxcy=final,
         initial_fxfycxcy=scene.fxfycxcy.detach().clone(),
         camera_model=scene.camera_model,
         history=history,
         num_lines=num_lines,
+        alpha_frozen_by_gate=alpha_frozen_by_gate,
+        hit_focal_limit=hit_limit,
     )
