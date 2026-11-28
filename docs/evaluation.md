@@ -96,3 +96,44 @@ Gaussian window with sigma 1.5 over a data range of 1, implemented in
 `erayzer_core/utils/image_metrics.py` because the container image carries
 neither torchmetrics nor skimage. LPIPS would need a package the image does
 not have, so it is not reported.
+
+## Cameras whose true parameters we know
+
+`slurm/camera_benchmark.sh` answers the question the camera work is measured
+by: given images of a camera the model is not told about, how close does it
+get to that camera. It resamples the 195 degree `lcam_fish` frames of one
+environment into a fixed list of test cameras and compares what the model
+predicts with what the camera really is.
+
+```bash
+sbatch --export=ALL,RUN_NAME=b90-ucm-long,ENV_NAME=HongKong slurm/camera_benchmark.sh
+sbatch --export=ALL,RUN_NAME=b90-ucm-long,ENV_NAME=HongKong,CAMERA_SET=front \
+    slurm/camera_benchmark.sh
+```
+
+The test cameras, fifteen of them, are fixed in `scripts/camera_benchmark.py`
+and contain no randomness at all.
+
+| Family | Field of view across the width | alpha |
+| --- | --- | --- |
+| Pinhole | 60, 90, 120 | 0 exactly |
+| Equidistant fisheye | 120, 150, 195 | the UCM fit of the true mapping, about 0.65, 0.64 and 0.62 |
+| UCM | 130, 160, 190 | 0.4, 0.62 and 0.8, every combination, all nine valid |
+
+`CAMERA_SET=front` drops the remap and scores the real `image_lcam_front.zip`
+of the same environment, a pinhole whose field of view the loader has always
+assumed to be 90 degrees across the width; `FRONT_FOV` overrides that.
+
+Two things make the numbers of two checkpoints comparable. The frames come
+from `SEED` alone, never from the checkpoint or the camera, and they are
+listed at the end of `summary.txt`. The scoring mask is a function of the
+test camera only, the remap validity inside the circle spanning the image
+width (`MASK=valid` keeps the corners of a narrow pinhole, `MASK=full` scores
+everything), so two models with very different predicted cameras are still
+scored on the same pixels.
+
+The output folder holds `cameras.csv` with one row per test camera,
+`summary.txt` with the same table plus the pass or fail of the five degree
+field of view criterion, and `panel_<family>.png` with the ground truth next
+to the rendering for every camera of one family. `BASELINE_CSV` points at the
+`cameras.csv` of another run and adds the difference to the summary.
