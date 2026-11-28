@@ -1,13 +1,17 @@
 #!/bin/bash
 #SBATCH --job-name=build-image
 #SBATCH --partition=12g
-#SBATCH --gres=gpu:1
 #SBATCH --time=03:00:00
 #SBATCH --output=/mnt/home/%u/runs/%x-%j.out
 #SBATCH --error=/mnt/home/%u/runs/%x-%j.err
 
 # Builds the container image from docker/Dockerfile and stores it as a single
 # squashfs file in the shared team folder. Only needed when docker/ changes.
+#
+# This job is pure CPU and disk work, so it asks for no GPU. The cluster
+# reports jobs that reserve a GPU without using one. If the scheduler should
+# refuse jobs without --gres on the GPU partition 12g, run the build on the
+# CPU partition instead: sbatch --partition=data slurm/build_image.sh
 set -euo pipefail
 source "${REPO_DIR:-/mnt/home/$USER/code/P3DCV}/slurm/common.sh"
 
