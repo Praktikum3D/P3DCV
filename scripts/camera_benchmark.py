@@ -259,6 +259,8 @@ CSV_FIELDS = [
     "RPA@15",
     "RPA@30",
     "n_samples",
+    "n_finite_fov",
+    "n_finite_psnr",
 ]
 """Columns of `cameras.csv`, in this order. Appending is allowed, reordering breaks every reader."""
 
@@ -281,13 +283,25 @@ FLOAT_FORMAT = {
 }
 
 
-def _mean(values: Sequence[float]) -> float:
-    finite = [v for v in values if v is not None and math.isfinite(v)]
+def _finite(values: Sequence[Optional[float]]) -> List[float]:
+    """The values a mean may be taken over, which is every one that is neither None nor NaN nor inf.
+
+    Dropping the others is right, an unstable sample must not turn a whole row into NaN, but it is
+    only honest if the drop is visible: a checkpoint that diverges on three of ten samples would
+    otherwise be averaged over its seven good ones and look better than one that survives all ten.
+    `n_finite_fov` and `n_finite_psnr` therefore count what actually went into the means, and
+    `summary_text` warns whenever that count is below `n_samples`.
+    """
+    return [float(v) for v in values if v is not None and math.isfinite(v)]
+
+
+def _mean(values: Sequence[Optional[float]]) -> float:
+    finite = _finite(values)
     return float(np.mean(finite)) if finite else float("nan")
 
 
-def _std(values: Sequence[float]) -> float:
-    finite = [v for v in values if v is not None and math.isfinite(v)]
+def _std(values: Sequence[Optional[float]]) -> float:
+    finite = _finite(values)
     return float(np.std(finite)) if finite else float("nan")
 
 
@@ -297,8 +311,9 @@ def summarise_camera(camera: AugCamera, name: str, records: List[Dict[str, float
     alpha_true_value = true_alpha(camera)
     fov_pred = [r["fov_pred"] for r in records]
     alpha_pred = [r["alpha_pred"] for r in records if r["alpha_pred"] is not None]
-    fov_err = _mean([abs(value - fov_true) for value in fov_pred])
-    alpha_err = _mean([abs(value - alpha_true_value) for value in alpha_pred])
+    psnr = [r["psnr"] for r in records]
+    fov_err = _mean([abs(value - fov_true) for value in _finite(fov_pred)])
+    alpha_err = _mean([abs(value - alpha_true_value) for value in _finite(alpha_pred)])
     mse = _mean([r["mse"] for r in records])
     row: Dict[str, object] = {
         "camera": name,
@@ -312,7 +327,7 @@ def summarise_camera(camera: AugCamera, name: str, records: List[Dict[str, float
         "alpha_pred_mean": _mean(alpha_pred),
         "alpha_pred_std": _std(alpha_pred),
         "alpha_err": alpha_err,
-        "psnr": _mean([r["psnr"] for r in records]),
+        "psnr": _mean(psnr),
         "ssim": _mean([r["ssim"] for r in records]),
         "mse": mse,
         "mask_fraction": _mean([r["mask_fraction"] for r in records]),
@@ -320,8 +335,21 @@ def summarise_camera(camera: AugCamera, name: str, records: List[Dict[str, float
         "RPA@15": _mean([r["RPA@15"] for r in records]),
         "RPA@30": _mean([r["RPA@30"] for r in records]),
         "n_samples": len(records),
+        # How many samples the field of view and the PSNR mean really rest on, see `_finite`.
+        "n_finite_fov": len(_finite(fov_pred)),
+        "n_finite_psnr": len(_finite(psnr)),
     }
     return row
+
+
+def unstable_rows(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """The rows whose means rest on fewer samples than the row claims to have scored."""
+    return [
+        row
+        for row in rows
+        if int(row["n_finite_fov"]) < int(row["n_samples"])
+        or int(row["n_finite_psnr"]) < int(row["n_samples"])
+    ]
 
 
 def write_csv(path: str, rows: List[Dict[str, object]]) -> None:
@@ -390,6 +418,20 @@ def summary_text(
     )
     lines.append(f"mean psnr {_mean([float(row['psnr']) for row in rows]):.3f}")
     lines.append(f"mean ssim {_mean([float(row['ssim']) for row in rows]):.4f}")
+
+    unstable = unstable_rows(rows)
+    if unstable:
+        lines.append("")
+        lines.append(
+            f"WARNING: {len(unstable)} of {len(rows)} cameras produced samples the metrics could not "
+            "use (NaN or infinite). Their means rest on the remaining samples only, so these numbers "
+            "flatter an unstable checkpoint. n_finite_fov and n_finite_psnr in the CSV say how many."
+        )
+        for row in unstable:
+            lines.append(
+                f"  {row['camera']:<18} fov {int(row['n_finite_fov'])} of {int(row['n_samples'])}, "
+                f"psnr {int(row['n_finite_psnr'])} of {int(row['n_samples'])}"
+            )
 
     if baseline:
         lines.append("")

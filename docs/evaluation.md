@@ -137,3 +137,11 @@ The output folder holds `cameras.csv` with one row per test camera,
 field of view criterion, and `panel_<family>.png` with the ground truth next
 to the rendering for every camera of one family. `BASELINE_CSV` points at the
 `cameras.csv` of another run and adds the difference to the summary.
+
+A sample whose metric came out NaN or infinite is left out of the mean, which
+keeps one diverged scene from erasing a whole row, but it would make an
+unstable checkpoint look better than a stable one. The columns `n_finite_fov`
+and `n_finite_psnr` therefore say how many samples each mean really rests on,
+and `summary.txt` carries a `WARNING` block naming every camera where that is
+below `n_samples`. A camera that fails on all of its samples still fails the
+criterion.

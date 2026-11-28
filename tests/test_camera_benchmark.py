@@ -277,6 +277,7 @@ def test_the_csv_schema_is_the_documented_one(tmp_path):
         "camera", "camera_model", "fov_true", "fov_pred_mean", "fov_pred_std", "fov_err", "fov_pass",
         "alpha_true", "alpha_pred_mean", "alpha_pred_std", "alpha_err",
         "psnr", "ssim", "mse", "mask_fraction", "RPA@5", "RPA@15", "RPA@30", "n_samples",
+        "n_finite_fov", "n_finite_psnr",
     ]
     camera = AugCamera("ucm", 160.0, 0.62)
     records = [
@@ -292,6 +293,7 @@ def test_the_csv_schema_is_the_documented_one(tmp_path):
     assert row["fov_pass"] == 1
     assert row["alpha_err"] == pytest.approx(0.02)
     assert row["n_samples"] == 2
+    assert row["n_finite_fov"] == 2 and row["n_finite_psnr"] == 2
 
     path = str(tmp_path / "cameras.csv")
     bench.write_csv(path, [row])
@@ -312,6 +314,53 @@ def test_a_camera_above_the_limit_fails():
     assert row["fov_pass"] == 0
     text = bench.summary_text([row], {"checkpoint": "none"}, None)
     assert "FAIL" in text and "fisheye_195" in text
+
+
+def sample_record(fov_pred, psnr=20.0):
+    return {"mse": 0.01, "psnr": psnr, "ssim": 0.8, "mask_fraction": 0.7, "fov_pred": fov_pred,
+            "alpha_pred": 0.6, "RPA@5": 0.5, "RPA@15": 0.75, "RPA@30": 1.0}
+
+
+def test_samples_the_metrics_could_not_use_are_counted_and_warned_about():
+    """A checkpoint that diverges on some samples must not be flattered by the mean of the rest."""
+    camera = AugCamera("ucm", 190.0, 0.62)
+    records = [
+        sample_record(188.0),
+        sample_record(float("nan")),
+        sample_record(192.0, psnr=float("inf")),
+    ]
+    row = bench.summarise_camera(camera, "ucm_190_a062", records)
+    assert row["n_samples"] == 3
+    assert row["n_finite_fov"] == 2, "the NaN field of view does not count towards the mean"
+    assert row["n_finite_psnr"] == 2, "an infinite psnr does not count either"
+    assert row["fov_err"] == pytest.approx(2.0), "the mean is still taken over the usable samples"
+    assert row["psnr"] == pytest.approx(20.0)
+
+    assert bench.unstable_rows([row]) == [row]
+    text = bench.summary_text([row], {"checkpoint": "none"}, None)
+    assert "WARNING" in text
+    assert "ucm_190_a062" in text and "fov 2 of 3" in text and "psnr 2 of 3" in text
+
+
+def test_a_clean_run_carries_no_warning():
+    camera = AugCamera("ucm", 190.0, 0.62)
+    row = bench.summarise_camera(camera, "ucm_190_a062", [sample_record(188.0), sample_record(192.0)])
+    assert row["n_finite_fov"] == row["n_finite_psnr"] == row["n_samples"] == 2
+    assert bench.unstable_rows([row]) == []
+    assert "WARNING" not in bench.summary_text([row], {"checkpoint": "none"}, None)
+
+
+def test_a_camera_that_fails_on_every_sample_still_fails():
+    """Dropping the unusable samples must not turn an all NaN camera into a pass."""
+    camera = AugCamera("ucm", 190.0, 0.62)
+    row = bench.summarise_camera(
+        camera, "ucm_190_a062", [sample_record(float("nan")), sample_record(float("nan"))]
+    )
+    assert row["n_finite_fov"] == 0
+    assert math.isnan(float(row["fov_err"]))
+    assert row["fov_pass"] == 0
+    text = bench.summary_text([row], {"checkpoint": "none"}, None)
+    assert "FAIL" in text and "WARNING" in text
 
 
 # --- end to end with a stubbed model ---------------------------------------------------------------
@@ -425,6 +474,7 @@ def test_a_whole_run_writes_the_table_the_summary_and_the_panels(tmp_path, monke
         assert float(row["fov_err"]) == pytest.approx(abs(expected_fov - float(row["fov_true"])), abs=1e-3)
         assert float(row["alpha_pred_mean"]) == pytest.approx(0.62, abs=1e-6)
         assert int(row["n_samples"]) == 1
+        assert int(row["n_finite_fov"]) == 1 and int(row["n_finite_psnr"]) == 1
         assert 0.0 < float(row["mask_fraction"]) <= 1.0
         assert float(row["psnr"]) > 0.0
 
@@ -435,6 +485,7 @@ def test_a_whole_run_writes_the_table_the_summary_and_the_panels(tmp_path, monke
     assert "PASS" in summary or "FAIL" in summary
     assert "frames, identical for every camera and every checkpoint" in summary
     assert "frames [0, 1, 3, 5]" in summary, "the frames have to be named, not just counted"
+    assert "WARNING" not in summary, "the stub is stable, so nothing may be dropped from a mean"
 
 
 def test_two_runs_feed_the_model_identical_frames(tmp_path, monkeypatch):
