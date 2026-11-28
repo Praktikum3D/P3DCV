@@ -454,6 +454,13 @@ class ERayZer(nn.Module):
         data_mask_all = data.get("data_mask")
         if data_mask_all is not None:
             data_mask_all = data_mask_all.to(device=device, dtype=image_data_all.dtype)
+        # The lines the loader detected in every view, [b, v_all, n_max, K, 2] in the pixels of that
+        # view, and how many of its rows are real, [b, v_all]. Present only when the dataset runs
+        # with detect_lines. They travel exactly like data_mask: padded with the views, picked with
+        # the same input_idx as the images, and handed to the caller already gathered, because the
+        # view split is drawn in here and nobody outside can repeat it (see result.input_line_pixels).
+        line_pixels_all = data.get("line_pixels")
+        line_count_all = data.get("line_count")
 
         # Padding input to 10 views if less than 10 views (repeat the last view)
         if v < 10:
@@ -467,6 +474,11 @@ class ERayZer(nn.Module):
             if data_mask_all is not None:  # the padded views repeat the last one, mask included
                 last_mask = data_mask_all[:, -1:, ...].repeat(1, pad_views, 1, 1, 1)
                 data_mask_all = torch.cat([data_mask_all, last_mask], dim=1)
+            if line_pixels_all is not None:  # and lines included, or input_idx would index past them
+                last_lines = line_pixels_all[:, -1:, ...].repeat(1, pad_views, 1, 1, 1)
+                line_pixels_all = torch.cat([line_pixels_all, last_lines], dim=1)
+                last_count = line_count_all[:, -1:].repeat(1, pad_views)
+                line_count_all = torch.cat([line_count_all, last_count], dim=1)
         else:
             pad_input = False
             v_all = v
@@ -541,7 +553,11 @@ class ERayZer(nn.Module):
         if data_mask_all is not None:
             data_mask_input = data_mask_all[batch_idx, input_idx]                # [b, v_input, 1, h, w]
             data_mask_target = data_mask_all[batch_idx, target_idx]              # [b, v_target, 1, h, w]
-    
+        line_pixels_input = line_count_input = None
+        if line_pixels_all is not None:
+            line_pixels_input = line_pixels_all[batch_idx, input_idx]            # [b, v_input, n_max, K, 2]
+            line_count_input = line_count_all[batch_idx, input_idx]              # [b, v_input]
+
         plucker_rays_input = cam_info_to_plucker(c2w_input, fxfycxcy_input, self.config.model.target_image, normalized=normalized, return_moment=True, camera_model=self.config.model.get("camera_model", "pinhole"))
         plucker_rays_input = rearrange(plucker_rays_input, '(b v) c h w -> b v h w c', b=b, v=v_input)
         plucker_emb_input = self.input_pose_tokenizer(plucker_rays_input)                                     # [b*v_input, n, d]
@@ -715,6 +731,15 @@ class ERayZer(nn.Module):
             # The target views are a random subset of all views, so the loss cannot use the batch
             # field directly; it needs the same subset the rendered images belong to.
             result.target_data_mask = data_mask_target
+
+        if line_pixels_input is not None:
+            # Same reason as target_data_mask, for the INPUT views this time: the plumb line loss
+            # scores the camera that the input views were tokenized with, so it needs the lines of
+            # exactly those views, gathered with the very input_idx the images were gathered with.
+            # Doing the gather out here instead of in the loss is what rules out a misalignment:
+            # there is only one index tensor and only one place that uses it.
+            result.input_line_pixels = line_pixels_input
+            result.input_line_count = line_count_input
 
         if vis_only_results is not None:
             result.render_video = vis_only_results.rendered_images_video.detach().clamp(0, 1)

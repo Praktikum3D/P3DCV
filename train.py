@@ -24,6 +24,7 @@ from erayzer_core.losses import PerceptualLoss
 from erayzer_core.model.utils_gaussian import UCM_MODELS, camera_theta, loss_render_mask
 from training.camera_augmentation import MODEL_CODES
 from training.datasets import build_dataset as build_config_dataset
+from training.line_geometry import DEFAULT_TRIM, plumbline_residual_mean
 
 
 def _to_edict(value: Any) -> Any:
@@ -300,6 +301,68 @@ def build_loss_modules(config: edict, device: torch.device) -> edict:
     return modules
 
 
+def plumbline_loss(result: edict, config: edict) -> torch.Tensor:
+    """The plumb line residual of the input views under the PREDICTED camera, a scalar, or None.
+
+    The pixels of one straight 3D line have coplanar viewing rays through the projection centre, and
+    whether they do is decided by the intrinsics alone (`training/line_geometry.py` derives it). So
+    this term scores the predicted focal length, alpha and beta against the lines the loader found,
+    with no ground truth camera and no reprojection anywhere, and its gradient reaches the camera
+    heads directly rather than through the rendering.
+
+    Returns None, and costs nothing at all, unless `training.line_loss_weight` is positive AND the
+    batch carried lines (`dataset.detect_lines`); then the caller adds weight * residual to the loss.
+
+    The lines come off `result.input_line_pixels`, which the model gathered with the same `input_idx`
+    it gathered the images with, and the intrinsics off `result.fxfycxcy_input`, before any detach,
+    normalised by the image size exactly as `cam_info_to_plucker` receives them. Both tensors are
+    cast to float32: the eigenvalue math behind the residual reads ratios of small numbers and bf16
+    autocast would turn them into noise.
+
+    A pinhole `model.camera_model` is a degenerate case worth naming: the rays of ANY set of
+    collinear pixels are coplanar under a pinhole camera, so the residual is zero whatever the focal
+    length is and this term teaches nothing. It stays switched on for pinhole only because turning it
+    into an error would be a surprise in a sweep; the number it logs is the honest zero.
+
+    The detection resolution decides whether this term helps or hurts
+    ----------------------------------------------------------------
+    `dataset.line_native_size` is not a detail, it is the setting the term stands or falls with, and
+    with camera augmentation the dataset's own default of 512 is NOT enough. Measured over twelve
+    augmented samples from `data-sample`, perturbing the focal length to 1.0372 times the drawn one
+    (the 188 degrees instead of 195 the trained model sits at) and asking which way the residual
+    then wants to move it:
+
+        line_native_size            256     512     768       0 (1000)
+        points to a wider camera   1/12    1/12   10/12        8/12
+        of the drawn cameras wider than 150 degrees
+                                    0/6     0/6     6/6         6/6
+        mean residual at 1.0372  2.1e-4  1.2e-4  5.5e-5      4.3e-5
+        ms per sample (4 views)     463    1083    2125        4492
+
+    At 512 the term would push the field of view further from 195 degrees on nearly every sample,
+    which is the opposite of what it is for. From 768 on it points the right way on every wide
+    camera, and the narrow ones (below 150 degrees, where a line is almost straight in the image and
+    carries little curvature) stay close to indifferent. So a sieve run wants
+    `-s dataset.line_native_size 768` and enough workers to pay for it. The same measurement on
+    UNAUGMENTED full frames came out in favour of 512 (`training/tartanair_dataset.py`); the
+    augmentation resamples the view and costs the detection a step of sharpness on top.
+    """
+    weight = float(config.training.get("line_loss_weight", 0.0))
+    if weight <= 0.0 or "input_line_pixels" not in result:
+        return None
+    pixels = result.input_line_pixels.float()                       # [b, v_input, n_max, K, 2]
+    intrinsics = result.fxfycxcy_input.float()[:, :, None, :]       # [b, v_input, 1, d], one per line
+    h, w = result.image.shape[-2:]
+    return plumbline_residual_mean(
+        intrinsics,
+        config.model.get("camera_model", "pinhole"),
+        pixels,
+        (int(h), int(w)),
+        normalized_intrinsics=True,
+        trim=float(config.training.get("line_loss_trim", DEFAULT_TRIM)),
+    )
+
+
 def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, loss_modules: edict) -> edict:
     pred = result.render.clamp(0.0, 1.0)
     target = result.get("target_image", batch["image"])
@@ -354,6 +417,12 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
     loss = float(config.training.get("l2_loss_weight", 1.0)) * mse
     loss = loss + float(config.training.get("l1_loss_weight", 0.0)) * l1
     loss = loss + float(config.training.get("perceptual_loss_weight", 0.0)) * perceptual
+    # Off by default, and then not even added: with line_loss_weight at 0 the loss tensor is the very
+    # same one the run produced before this term existed, down to the last bit.
+    residual = plumbline_loss(result, config)
+    line_residual = pred.new_tensor(0.0) if residual is None else residual.detach().to(pred.dtype)
+    if residual is not None:
+        loss = loss + float(config.training.line_loss_weight) * residual
     psnr = -10.0 * torch.log10(mse.clamp_min(1e-8))
     return edict(
         loss=loss,
@@ -362,6 +431,7 @@ def compute_loss(result: edict, batch: Dict[str, torch.Tensor], config: edict, l
         perceptual=perceptual.detach(),
         psnr=psnr.detach(),
         mask_fraction=pred.new_tensor(inside),
+        line_residual=line_residual,
     )
 
 
@@ -693,6 +763,11 @@ def main() -> None:
                         "train/grad_norm": float(grad_norm),
                         "train/param_update_step": param_update_step,
                         "train/mask_fraction": metrics.mask_fraction.item(),
+                        # The residual itself and what it contributes to the loss. Both are a
+                        # constant zero while training.line_loss_weight is zero.
+                        "train/line_residual": metrics.line_residual.item(),
+                        "train/line_loss": float(config.training.get("line_loss_weight", 0.0))
+                        * metrics.line_residual.item(),
                         **camera_stats(result, config.model.get("camera_model", "pinhole")),
                         **aug_stats(result, batch, config.model.get("camera_model", "pinhole")),
                     }

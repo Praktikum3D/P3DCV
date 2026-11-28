@@ -129,6 +129,18 @@ if [[ -n "${LEARN_BETA:-}" ]]; then
         "${EXTRA_ARGS[@]}"
     )
 fi
+# LINE_LOSS_WEIGHT turns the plumb line loss on and switches the line detection in the loader on with
+# it, since the loss is silent without the lines. Leave it unset for every run that does not want the
+# term; the detection costs the workers real time and wants NUM_WORKERS raised with it. With camera
+# augmentation also pass -s dataset.line_native_size 768, see the measurement in train.plumbline_loss:
+# at the dataset default of 512 the term pushes the field of view the WRONG way.
+if [[ -n "${LINE_LOSS_WEIGHT:-}" ]]; then
+    EXTRA_ARGS=(
+        -s dataset.detect_lines true
+        -s training.line_loss_weight "$LINE_LOSS_WEIGHT"
+        "${EXTRA_ARGS[@]}"
+    )
+fi
 if [[ -n "$WANDB_PROJECT" ]]; then
     EXTRA_ARGS=(
         -s training.wandb_project "$WANDB_PROJECT"
