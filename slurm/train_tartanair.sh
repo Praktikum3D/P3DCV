@@ -130,16 +130,24 @@ if [[ -n "${LEARN_BETA:-}" ]]; then
     )
 fi
 # LINE_LOSS_WEIGHT turns the plumb line loss on and switches the line detection in the loader on with
-# it, since the loss is silent without the lines. Leave it unset for every run that does not want the
-# term; the detection costs the workers real time and wants NUM_WORKERS raised with it. With camera
-# augmentation also pass -s dataset.line_native_size 768, see the measurement in train.plumbline_loss:
-# at the dataset default of 512 the term pushes the field of view the WRONG way.
+# it, since the loss is silent without the lines. Leave it unset for every run that does not want it.
+# LINE_CACHE_DIR points at what slurm/precompute_lines.sh built and is what makes the term affordable:
+# detecting in the training step costs about 12 seconds of CPU per sample against one second of GPU,
+# which is a job sitting at 25 percent GPU utilisation. With the cache the lines cost nothing
+# measurable and are detected at the full native resolution, which is also the only resolution where
+# the term points the right way, see the measurement in train.plumbline_loss.
 if [[ -n "${LINE_LOSS_WEIGHT:-}" ]]; then
     EXTRA_ARGS=(
         -s dataset.detect_lines true
         -s training.line_loss_weight "$LINE_LOSS_WEIGHT"
         "${EXTRA_ARGS[@]}"
     )
+    if [[ -n "${LINE_CACHE_DIR:-}" ]]; then
+        EXTRA_ARGS=(-s dataset.line_cache_dir "$LINE_CACHE_DIR" "${EXTRA_ARGS[@]}")
+    else
+        echo "WARNING: LINE_LOSS_WEIGHT without LINE_CACHE_DIR, every sample will detect its own" \
+             "lines and the GPU will idle; run slurm/precompute_lines.sh first" >&2
+    fi
 fi
 if [[ -n "$WANDB_PROJECT" ]]; then
     EXTRA_ARGS=(

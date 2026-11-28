@@ -378,10 +378,18 @@ def plumbline_loss(result: edict, config: edict) -> torch.Tensor:
     would push the field of view AWAY from 195 degrees, which is the failure it is meant to fix. The
     dataset's default of 512 is barely better than a coin toss on the wide cameras, 4 of 14. Only
     from 768 does the majority point the right way, and even there it is 9 of 14, not a clean
-    signal; the full 1000 reaches 11 of 14 at two and a half times the cost. So a sieve run wants at
-    least `-s dataset.line_native_size 768` and enough workers to pay for it, and a null result from
-    that run should be read as "the signal at this operating point is weak", not as "the loss is
-    broken".
+    signal; the full 1000 reaches 11 of 14 at two and a half times the cost. A null result from a
+    sieve run should therefore be read as "the signal at this operating point is weak", not as "the
+    loss is broken".
+
+    The cost column is why `dataset.line_cache_dir` exists and why nothing in it needs paying any
+    more. Detection is camera independent, so `scripts/precompute_lines.py` does it once per source
+    frame on a CPU only job and the loader keeps only the mapping. A sieve run then takes the BEST
+    row of this table, the native one, for free: measured end to end over ten view samples, a cached
+    sample costs 0.225 s against 0.275 s with the lines switched off entirely, which is to say the
+    lines cost nothing measurable, against 11.95 s detecting natively in the step. So set
+    `-s dataset.line_cache_dir <dir>` and leave `line_native_size` alone; it only applies to frames
+    that miss the cache.
 
     An earlier version of this table, over 12 samples of 4 views, reported 10/12 and 6/6 at 768. The
     numbers above supersede it: a reviewer's independent reproduction on different frames came out

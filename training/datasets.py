@@ -102,6 +102,7 @@ def build_dataset(config: edict, *, split: str) -> Dataset[Any]:
             line_chain=bool(dataset.get("line_chain", True)),
             line_detect_native=bool(dataset.get("line_detect_native", True)),
             line_native_size=int(dataset.get("line_native_size", DEFAULT_LINE_NATIVE_SIZE)),
+            line_cache_dir=dataset.get("line_cache_dir"),
         )
 
     raise ValueError(f"Unsupported config.dataset.name: {dataset_name!r}")

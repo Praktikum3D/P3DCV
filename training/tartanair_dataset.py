@@ -25,6 +25,16 @@ from training.camera_augmentation import (
     remap_views,
     sample_camera,
 )
+from training.line_cache import (
+    RAW_MAX_COUNT_FACTOR,
+    RAW_MIN_LENGTH,
+    CacheHeader,
+    LineCache,
+    cache_file_name,
+    detect_source_lines,
+    frame_key,
+    group_of,
+)
 from training.line_detection import (
     DEFAULT_MAX_COUNT,
     DEFAULT_MIN_LENGTH,
@@ -35,6 +45,19 @@ from training.line_detection import (
     image_circle_mask,
     resolve_min_length,
 )
+
+_WARNED: set = set()
+"""Messages already printed in this process, so a per sample condition warns once and not per step.
+
+Workers are separate processes, so the warning appears once per worker, which is what makes it
+visible at all: a worker that silently fell back to in step detection would just look slow.
+"""
+
+
+def _warn_once(message: str) -> None:
+    if message not in _WARNED:
+        _WARNED.add(message)
+        print(f"WARNING: {message}", flush=True)
 
 DEFAULT_LINE_NATIVE_SIZE = 512
 """Side the source frame is resized to before lines are detected on it, 0 for the full 1000.
@@ -242,6 +265,7 @@ class TartanAirDataset(Dataset):
         line_chain: bool = True,
         line_detect_native: bool = True,
         line_native_size: int = DEFAULT_LINE_NATIVE_SIZE,
+        line_cache_dir: Optional[str] = None,
     ) -> None:
         self.dataset_path = os.path.abspath(os.path.expanduser(dataset_path))
         self.camera_name = camera_name
@@ -271,6 +295,12 @@ class TartanAirDataset(Dataset):
         self.line_chain = bool(line_chain)
         self.line_detect_native = bool(line_detect_native)
         self.line_native_size = max(0, int(line_native_size))
+        # Where `scripts/precompute_lines.py` put its cache files. Unset means every sample detects
+        # its own lines, which is correct but costs seconds per sample and starves the GPU; see
+        # `training/line_cache.py`. With it set, `line_native_size` applies only to the frames that
+        # miss the cache, because a cache is built at the native resolution already.
+        self.line_cache_dir = str(line_cache_dir) if line_cache_dir else None
+        self._line_caches: Dict[str, Optional[LineCache]] = {}
 
         self.trajectories = _discover_trajectories(self.dataset_path, camera_name=camera_name)
 
@@ -455,6 +485,8 @@ class TartanAirDataset(Dataset):
         data_mask: Optional[torch.Tensor],
         native_frames: Optional[List[np.ndarray]],
         camera: AugCamera,
+        record: Optional[_TrajectoryRecord] = None,
+        indices: Optional[Sequence[int]] = None,
     ) -> Dict[str, torch.Tensor]:
         """Lines of every view of this sample, in the pixels of the view, padded into batch tensors.
 
@@ -484,7 +516,7 @@ class TartanAirDataset(Dataset):
         knob and not the largest count found, so that the default collate can stack samples.
         """
         if native_frames is not None:
-            return self._detect_lines_on_source(images, data_mask, native_frames, camera)
+            return self._detect_lines_on_source(images, data_mask, native_frames, camera, record, indices)
 
         views = [images[i] for i in range(images.shape[0])]
         if data_mask is not None:
@@ -505,19 +537,105 @@ class TartanAirDataset(Dataset):
         )
         return {"line_pixels": pixels, "line_count": counts}
 
+    def _wanted_cache_header(self, source_size: int) -> CacheHeader:
+        """The header this dataset would have written, for comparing against a cache file's."""
+        return CacheHeader(
+            source_size=int(source_size),
+            num_samples=self.line_samples,
+            max_count=RAW_MAX_COUNT_FACTOR * self.line_max_count,
+            min_length=RAW_MIN_LENGTH,
+            detector=self.line_detector,
+            chain=self.line_chain,
+            camera_name=str(self.camera_name or ""),
+        )
+
+    def _line_cache_for(self, record: _TrajectoryRecord) -> Optional[LineCache]:
+        """The cache file covering this record, loaded once per worker, or None.
+
+        Every outcome that is not a plain hit warns exactly once per process: a missing file, a
+        file that cannot be read, and knobs that disagree with this dataset's. A silent fallback
+        would show up only as a slow job, which is the failure this whole module exists to avoid.
+        """
+        if not self.line_cache_dir:
+            return None
+        group = group_of(record.archive_path, record.name)
+        if group in self._line_caches:
+            return self._line_caches[group]
+
+        path = os.path.join(self.line_cache_dir, cache_file_name(record.archive_path, record.name))
+        cache: Optional[LineCache] = None
+        if not os.path.isfile(path):
+            _warn_once(f"no line cache at {path}, detecting in the training step instead")
+        else:
+            try:
+                cache = LineCache.load(path)
+            except Exception as error:  # a broken cache must not take the run down with it
+                _warn_once(f"could not read the line cache {path} ({error}), detecting in the step")
+            else:
+                wanted = self._wanted_cache_header(cache.header.source_size)
+                for difference in cache.header.differences(wanted):
+                    _warn_once(f"line cache {os.path.basename(path)} was built with a different {difference}")
+                if cache.header.num_samples != self.line_samples:
+                    # The stored rows have the wrong K and cannot be reshaped into what the batch
+                    # tensor needs, so this one really is unusable.
+                    _warn_once(f"line cache {os.path.basename(path)} is unusable, detecting in the step")
+                    cache = None
+        self._line_caches[group] = cache
+        return cache
+
+    def _source_lines(
+        self,
+        record: Optional[_TrajectoryRecord],
+        frame_idx: Optional[int],
+        frame: np.ndarray,
+        cache: Optional[LineCache],
+    ) -> Tuple[np.ndarray, int]:
+        """Chains of one source frame as [n, K, 2] plus the resolution they are expressed in.
+
+        From the cache when it holds this frame, which costs a slice of a memory mapped tensor.
+        Otherwise by detecting, which costs a second and a half per frame and warns once.
+        """
+        if cache is not None and record is not None and frame_idx is not None:
+            key = frame_key(record.archive_path, record.name, record.frame_entries[frame_idx])
+            rows = cache.get(key, max_count=RAW_MAX_COUNT_FACTOR * self.line_max_count)
+            if rows is not None:
+                return rows, int(cache.header.source_size)
+            _warn_once(
+                f"line cache {os.path.basename(cache.path)} has no entry for {key}, "
+                "detecting that frame in the training step"
+            )
+
+        source_size = int(frame.shape[0])
+        if self.line_native_size and self.line_native_size < source_size:
+            source_size = self.line_native_size
+        return detect_source_lines(
+            frame,
+            source_size=source_size,
+            num_samples=self.line_samples,
+            max_count=RAW_MAX_COUNT_FACTOR * self.line_max_count,
+            min_length=RAW_MIN_LENGTH,
+            detector=self.line_detector,
+            chain=self.line_chain,
+        ), source_size
+
     def _detect_lines_on_source(
         self,
         images: torch.Tensor,
         data_mask: Optional[torch.Tensor],
         native_frames: List[np.ndarray],
         camera: AugCamera,
+        record: Optional[_TrajectoryRecord] = None,
+        indices: Optional[Sequence[int]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Detect on the `lcam_fish` source frames and map the pixels into the view."""
+        """Map the source frames' chains into the view, detecting them only if no cache has them.
+
+        The detection is the camera independent half and belongs in `scripts/precompute_lines.py`;
+        everything below the mapping is the per sample half and is what this is supposed to cost.
+        `record` and `indices` identify the frames in the cache, and without them (or without
+        `dataset.line_cache_dir`) every frame is detected here as it always was.
+        """
         size = int(images.shape[-1])
-        source_size = int(native_frames[0].shape[0])
-        if self.line_native_size and self.line_native_size < source_size:
-            source_size = self.line_native_size
-        circle = image_circle_mask(source_size)
+        cache = self._line_cache_for(record) if record is not None else None
         min_px = resolve_min_length(self.line_min_length, (size, size))
 
         pixels = torch.full(
@@ -525,24 +643,15 @@ class TartanAirDataset(Dataset):
         )
         counts = torch.zeros(len(native_frames), dtype=torch.long)
         for view, frame in enumerate(native_frames):
-            if frame.shape[0] != source_size:
-                frame = cv2.resize(frame, (source_size, source_size), interpolation=cv2.INTER_AREA)
+            frame_idx = int(indices[view]) if indices is not None else None
             # The length cut waits until the pixels are in the view: a line that is short on the
             # 195 degree source can fill a narrow drawn camera, and one that is long there can fall
-            # outside it entirely. Generous limits here, the real ones are applied after the map.
-            found = detect_line_segments(
-                frame,
-                mask=circle,
-                min_length=0.05,
-                max_count=8 * self.line_max_count,
-                num_samples=self.line_samples,
-                detector=self.line_detector,
-                chain=self.line_chain,
-            )
-            if len(found) == 0:
+            # outside it entirely. Generous limits at the source, the real ones after the map.
+            source_pixels, source_size = self._source_lines(record, frame_idx, frame, cache)
+            if len(source_pixels) == 0:
                 continue
 
-            mapped, valid = map_fisheye_pixels(found.pixels, camera, size, source_size)
+            mapped, valid = map_fisheye_pixels(source_pixels, camera, size, source_size)
             keep = valid.all(axis=-1)  # every sampled pixel of the line has to be imaged
             if data_mask is not None and keep.any():
                 mask = data_mask[view, 0] > 0.5
@@ -662,7 +771,7 @@ class TartanAirDataset(Dataset):
 
             if self.detect_lines:
                 extra.update(self._detect_lines(stacked_images, extra.get("data_mask"),
-                                                native_frames, camera))
+                                                native_frames, camera, record, indices))
 
             return {
                 "image": stacked_images,
@@ -679,4 +788,6 @@ class TartanAirDataset(Dataset):
     def __getstate__(self) -> Dict[str, Any]:
         state = self.__dict__.copy()
         state["_zip_cache"] = {}
+        # Loaded lazily per worker, and memory mapped, so neither handle survives pickling.
+        state["_line_caches"] = {}
         return state
