@@ -114,6 +114,17 @@ class CacheHeader:
                 # longest first, so the reader truncates and gets what it would have detected.
                 if int(mine) >= int(theirs):
                     continue
+                # Fewer is a real one, and the only difference that silently changes the OUTPUT
+                # rather than just the provenance: the surplus of raw chains a cache carries is what
+                # survives the mapping and the data mask, so a short cache yields fewer lines per
+                # view than an in step detection would. It is still far better than detecting in the
+                # step, so the reader uses it; the message has to say what it costs.
+                out.append(
+                    f"max_count {theirs!r} wanted, only {mine!r} in the cache, so fewer lines "
+                    "survive the mapping than detecting in the step would give; rebuild the cache "
+                    "with a larger --max-count to make the two identical again"
+                )
+                continue
             elif name == "detector" and "auto" in (str(mine), str(theirs)):
                 continue  # "auto" resolves to whatever the build offers, the same on both sides
             if mine != theirs:
@@ -181,8 +192,27 @@ def detect_source_lines(
     return np.ascontiguousarray(found.pixels, dtype=np.float32)
 
 
+def temp_path_for(path: str) -> str:
+    """Where `write_cache` builds a file before moving it into place.
+
+    A sibling, so the rename stays within one filesystem and therefore atomic, and a suffix nothing
+    else looks for: `cache_file_name` only ever produces `.pt`, so neither the precompute script's
+    "already done" check nor a dataset reader can mistake a leftover for a finished cache.
+    """
+    return path + ".tmp"
+
+
 def write_cache(path: str, header: CacheHeader, rows: Sequence[Tuple[str, np.ndarray]]) -> Dict[str, Any]:
-    """Write one cache file from `(key, pixels)` pairs. Returns a small summary dict."""
+    """Write one cache file from `(key, pixels)` pairs. Returns a small summary dict.
+
+    Written to a sibling `.tmp` and then renamed, which on one filesystem is atomic, so the final
+    path only ever holds a complete file. That matters more than it looks: a job killed mid write
+    would otherwise leave a truncated `.pt` that the precompute script counts as done and skips on
+    resubmit, while every training worker fails to read it and falls back to detecting in the step.
+    The result would be a run that is merely slow, which is exactly the failure this module exists
+    to prevent and the hardest kind to notice. A leftover `.tmp` is harmless: nothing looks for that
+    name, and the next attempt overwrites it.
+    """
     keys = [str(key) for key, _ in rows]
     arrays = [np.asarray(p, dtype=np.float32).reshape(-1, header.num_samples, 2) for _, p in rows]
     counts = [len(a) for a in arrays]
@@ -195,7 +225,9 @@ def write_cache(path: str, header: CacheHeader, rows: Sequence[Tuple[str, np.nda
     )
     header.created = header.created or time.strftime("%Y-%m-%dT%H:%M:%S")
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    torch.save({"header": asdict(header), "keys": keys, "offsets": offsets, "pixels": pixels}, path)
+    tmp = temp_path_for(path)
+    torch.save({"header": asdict(header), "keys": keys, "offsets": offsets, "pixels": pixels}, tmp)
+    os.replace(tmp, path)  # atomic within one filesystem, see the docstring
     return {
         "path": path,
         "frames": len(keys),

@@ -17,7 +17,9 @@ or directly, for one environment:
         --cache-dir /mnt/home/$USER/data/line-cache --envs HongKong
 
 One file per archive, named `<env>_<difficulty>_<camera>.pt`, holding every frame of it. Existing
-files are skipped unless `--overwrite`, so an interrupted job can simply be resubmitted.
+files are skipped unless `--overwrite`, so an interrupted job can simply be resubmitted: each file
+is built under a `.pt.tmp` name and renamed into place, so a kill mid write leaves no half file for
+the skip check to mistake for a finished one.
 """
 
 from __future__ import annotations

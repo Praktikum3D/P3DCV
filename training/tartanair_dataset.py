@@ -54,9 +54,16 @@ visible at all: a worker that silently fell back to in step detection would just
 """
 
 
-def _warn_once(message: str) -> None:
-    if message not in _WARNED:
-        _WARNED.add(message)
+def _warn_once(message: str, key: Optional[str] = None) -> None:
+    """Print `message` the first time this process sees `key` (the message itself by default).
+
+    The separate key is for warnings whose text names the thing that went wrong: one line per
+    MISSING FRAME would put thousands of lines in a training log and bury everything else, while
+    one line per cache file says the same thing and names an example.
+    """
+    marker = key if key is not None else message
+    if marker not in _WARNED:
+        _WARNED.add(marker)
         print(f"WARNING: {message}", flush=True)
 
 DEFAULT_LINE_NATIVE_SIZE = 512
@@ -600,9 +607,12 @@ class TartanAirDataset(Dataset):
             rows = cache.get(key, max_count=RAW_MAX_COUNT_FACTOR * self.line_max_count)
             if rows is not None:
                 return rows, int(cache.header.source_size)
+            # Keyed on the cache file, not on the frame: a cache covering half an archive would
+            # otherwise warn once per missing frame per worker and drown the log.
             _warn_once(
-                f"line cache {os.path.basename(cache.path)} has no entry for {key}, "
-                "detecting that frame in the training step"
+                f"line cache {os.path.basename(cache.path)} has no entry for {key} "
+                "(and possibly more frames), detecting those in the training step",
+                key=f"miss:{cache.path}",
             )
 
         source_size = int(frame.shape[0])

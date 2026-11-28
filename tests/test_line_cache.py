@@ -273,6 +273,75 @@ def test_a_bigger_cache_is_truncated_to_what_the_reader_asked_for():
         assert np.array_equal(LineCache.load(path).get("k", max_count=16), few)
 
 
+def test_the_final_path_only_ever_holds_a_complete_file():
+    """An interrupted write must leave nothing behind that looks finished.
+
+    The precompute script skips groups whose `.pt` already exists, so a half written file would be
+    skipped forever on resubmit while every training worker failed to read it and fell back to
+    detecting in the step. A rename makes that impossible.
+    """
+    import training.line_cache as lc
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "x.pt")
+        header = CacheHeader(source_size=256, num_samples=8)
+        rows = [("k", np.ones((2, 8, 2), np.float32))]
+
+        seen = {}
+        real_save = torch.save
+
+        def exploding_save(obj, where, *args, **kwargs):
+            seen["where"] = str(where)
+            raise KeyboardInterrupt("killed mid write")
+
+        lc.torch.save = exploding_save
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                write_cache(path, header, rows)
+        finally:
+            lc.torch.save = real_save
+
+        assert seen["where"] == lc.temp_path_for(path), "the write did not go through a temp file"
+        assert not os.path.exists(path), "an interrupted write left a file at the final path"
+
+        # a leftover temp file does not block or corrupt the retry
+        with open(lc.temp_path_for(path), "wb") as handle:
+            handle.write(b"half a tensor")
+        write_cache(path, header, rows)
+        assert np.array_equal(LineCache.load(path).get("k"), rows[0][1])
+        assert cache_file_name("/a/b/HongKong/Data_hard/image_lcam_fish.zip", "x").endswith(".pt")
+        assert not lc.temp_path_for(path).endswith(".pt"), "a temp file must not look like a cache"
+
+
+@needs_frames
+def test_many_missing_frames_warn_once_for_the_whole_cache(capsys):
+    """A partially covering cache must name itself once, not once per frame it is missing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        records = _discover_trajectories(SAMPLE_ROOT, camera_name=CAMERA)
+        record = records[0]
+        header = CacheHeader(source_size=256, num_samples=8,
+                             max_count=RAW_MAX_COUNT_FACTOR * 32, camera_name=CAMERA)
+        # One real entry and nothing else, so almost every frame of every sample misses.
+        rows = [(frame_key(record.archive_path, record.name, record.frame_entries[0]),
+                 detect_source_lines(open_frame(record, 0), source_size=256))]
+        write_cache(os.path.join(tmp, cache_file_name(record.archive_path, record.name)), header, rows)
+
+        data = dataset(line_cache_dir=tmp, line_native_size=256, num_views=4)
+        for index in range(3):
+            sample_at(data, index, 500 + index)
+        misses = [line for line in capsys.readouterr().out.splitlines() if "has no entry" in line]
+        assert len(misses) == 1, f"one line per missing frame would flood a log: {len(misses)}"
+
+
+def test_a_short_cache_says_what_it_costs():
+    """Fewer rows in the cache than the reader wants is the one difference that changes the output."""
+    built = CacheHeader(source_size=1000, num_samples=8, max_count=64)
+    wanted = CacheHeader(source_size=1000, num_samples=8, max_count=256)
+    messages = built.differences(wanted)
+    assert len(messages) == 1
+    assert "fewer lines survive" in messages[0] and "--max-count" in messages[0]
+
+
 def test_a_cache_from_another_version_is_refused():
     with tempfile.TemporaryDirectory() as tmp:
         header = CacheHeader(source_size=256, num_samples=8)
